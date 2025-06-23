@@ -42,8 +42,9 @@ typedef struct {
 int server_socket, port;
 entrada_tabla_archivo *tabla_archivos;
 
-
 void *handle_conexion(void *arg);
+void handle_file_server(char *buffer, datos_cliente_t *data);
+void handle_client(char *buffer, datos_cliente_t *data);
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -134,45 +135,33 @@ void *handle_conexion(void *arg) {
     int client_socket = data->client_socket;
     struct sockaddr_in client_addr = data->client_addr;
 
-    //recibir mensaje del cliente - primero determinar que es - client o file server
-    // mensaje lo recibo todo junto - lo tengo que parsear
-
-    //determinar si es un file_server o client - primer caracter que recibo, lo paso a nro
-    //0 => file server
-    //1 => client
-
-
     char buffer[MAX_MSG]; //al estar todo tamaño tiene que ser grande
     int flags = fcntl(client_socket, F_GETFL, 0);
     fcntl(client_socket, F_SETFL, flags & ~O_NONBLOCK);
 
     int bytes_recibidos = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
 
-    printf("Se recibieron %d bytes del cliente\n", bytes_recibidos);
-
-    if (bytes_recibidos < 0) {
-        printf("Error al recibir datos del cliente\n");
-        fcntl(client_socket, F_SETFL, flags);
-        return NULL;
-    }
-    buffer[bytes_recibidos] = '\0';
-
-    while (strncmp(buffer, "SALIR", 5) != 0) {
-        //en buffer esta todo el mensaje del cliente
-        printf("Mensaje del cliente: %s", buffer);
-        char *respuesta = "OK";
-        send(client_socket, respuesta, strlen(respuesta), 0);
-
-        memset(buffer, 0, sizeof(buffer)); //limpio buffer para sig mensaje
-        int bytes_recibidos = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-
+    //se espera que cliente envie multiples mensajes, por lo que se mantiene la conexion abierta hasta que el cliente la cierra, cerrrando el el socket
+    while (bytes_recibidos > 0) {
         printf("Se recibieron %d bytes del cliente\n", bytes_recibidos);
 
-        if (bytes_recibidos <= 0) {
-            printf("Cliente desconectado o error al recibir datos\n");
-            break;
-        }
         buffer[bytes_recibidos] = '\0';
+
+        char tipo_cliente = buffer[0];
+     
+        if (tipo_cliente == 'F') {
+            handle_file_server(buffer, data);
+        } else if (tipo_cliente == 'C') {
+            handle_client(buffer, data);
+        } else {
+            printf("Tipo de cliente desconocido: %c\n", tipo_cliente);
+            char *respuesta = "ERROR: Tipo de cliente no reconocido";
+            send(data->client_socket, respuesta, strlen(respuesta), 0);
+        }
+        
+        memset(buffer, 0, sizeof(buffer)); //limpio buffer para sig mensaje
+        bytes_recibidos = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+        printf("Bytes recibidos %d\n", bytes_recibidos);
     }
     
     printf("Cliente terminando conexion\n");
@@ -181,4 +170,31 @@ void *handle_conexion(void *arg) {
     close(client_socket);
     free(data);
     return NULL;
+}
+
+void handle_file_server(char *buffer, datos_cliente_t *data) {
+    printf("Procesando mensaje de File Server: %s", buffer);
+    char *comando = buffer + 1;
+    
+    char *respuesta = "FS_ACK";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+    
+    printf("Respuesta enviada al File Server: %s\n", respuesta);
+}
+
+void handle_client(char *buffer, datos_cliente_t *data) {
+    printf("Procesando mensaje de Cliente: %s", buffer);
+    char *comando = buffer + 1;
+
+    if (strncmp(comando, "SALIR", 5) == 0) {
+        char *respuesta = "DISCONNECT_ACK";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        printf("Cliente solicitó desconexión\n");
+        return;
+    }
+    
+    char *respuesta = "CLIENT_OK";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+    
+    printf("Respuesta enviada al Cliente: %s\n", respuesta);
 }
