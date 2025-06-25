@@ -185,6 +185,21 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
     strncpy(accion, comando, 2);
     accion[2] = '\0';
 
+    if (igual(accion, "RS")) {
+        // Register Server - registrar este cliente como file server
+        printf("Registrando cliente como file server\n");
+        
+        char client_ip[16];
+        inet_ntop(AF_INET, &data->client_addr.sin_addr, client_ip, sizeof(client_ip));
+        int client_port = ntohs(data->client_addr.sin_port);
+        
+        printf("File Server registrado - IP: %s, Puerto: %d\n", client_ip, client_port);
+        
+        char *respuesta = "REGISTERED_AS_FILE_SERVER";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+
     char *archivo_contenido = comando + 3; //2 letras y 1 espacio
     
     if (igual(accion, "AF")) {
