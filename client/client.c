@@ -284,5 +284,8 @@ void remove_file() {
 }
 
 void list_files() {
-    printf("Listando archivos disponibles en FNS\n");
+    printf("Solicitando lista de archivos al FNS...\n");
+    char command[MAX_MSG];
+    sprintf(command, "C LF");
+    send_client_request(command);
 }

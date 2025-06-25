@@ -54,6 +54,7 @@ void add_file_to_table(char *file_name, datos_cliente_t *data);
 void print_file_table();
 void print_file_table_unlocked();
 void remove_file_from_table(char *filename, datos_cliente_t *data);
+void send_file_list(datos_cliente_t *data);
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -218,7 +219,7 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
 }
 
 void handle_client(char *buffer, datos_cliente_t *data) {
-    printf("Procesando mensaje de Cliente: %s", buffer);
+    printf("Procesando mensaje de Cliente: %s\n", buffer);
     char *comando = buffer + 2; //estructura C comando
 
     if (strncmp(comando, "SALIR", 5) == 0) { //C SALIR
@@ -227,6 +228,10 @@ void handle_client(char *buffer, datos_cliente_t *data) {
         printf("Cliente solicitó desconexión\n");
         close(data->client_socket);
         printf("Cliente desconectado\n");
+        return;
+    } else if (strncmp(comando, "LF", 2) == 0) { //C LF
+        printf("Cliente solicitó lista de archivos\n");
+        send_file_list(data);
         return;
     }
     
@@ -454,5 +459,46 @@ void remove_file_from_table(char *filename, datos_cliente_t *data) {
     char *respuesta = "ERROR: Archivo no encontrado";
     send(data->client_socket, respuesta, strlen(respuesta), 0);
     printf("Intento de eliminar archivo inexistente: %s\n", filename);
+}
+
+void send_file_list(datos_cliente_t *data) {
+    pthread_mutex_lock(&tabla_mutex);
+    
+    char response[MAX_MSG];
+    
+    if (tabla_archivos == NULL) {
+        strcpy(response, "LIST_EMPTY: No hay archivos registrados");
+        pthread_mutex_unlock(&tabla_mutex);
+        send(data->client_socket, response, strlen(response), 0);
+        return;
+    }
+    
+    // Construir la lista de archivos
+    strcpy(response, "\nLISTA ARCHIVOS:\n");
+    entrada_tabla_archivo *current = tabla_archivos;
+    int count = 0;
+    
+    while (current != NULL && strlen(response) < MAX_MSG - 200) { // Dejar espacio para más info
+        if (count > 0) {
+            strcat(response, "\n");
+        }
+
+        char file_info[256];
+        struct in_addr addr;
+        addr.s_addr = htonl(current->ip);
+        char ip_str[16];
+        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+        
+        snprintf(file_info, sizeof(file_info), "%s | %s | %d | %s", current->nombre_archivo, ip_str, current->port, current->lock ? "LOCKED" : "UNLOCKED");
+        
+        strcat(response, file_info);
+        current = current->next;
+        count++;
+    }
+    
+    pthread_mutex_unlock(&tabla_mutex);
+    
+    printf("Enviando lista de %d archivos al cliente\n", count);
+    send(data->client_socket, response, strlen(response), 0);
 }
 
