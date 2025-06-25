@@ -65,9 +65,14 @@ void print_file_table_unlocked();
 void remove_file_from_table(char *filename, datos_cliente_t *data);
 void send_file_list(datos_cliente_t *data);
 void handle_read_file(char *filename, datos_cliente_t *data);
+void handle_write_file(char *filename, datos_cliente_t *data);
+void handle_write_back(char *buffer, datos_cliente_t *data);
 void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
 void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
+void request_file_for_write(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
+void send_modified_content_to_server(entrada_tabla_archivo *file_entry, char *content);
 void add_to_waiting_queue(entrada_tabla_archivo *file_entry, datos_cliente_t *client);
+void add_to_waiting_queue_front(entrada_tabla_archivo *file_entry, datos_cliente_t *client);
 void process_next_in_queue(entrada_tabla_archivo *file_entry);
 void register_file_server(uint32_t ip, int file_server_port);
 int find_file_server_port(uint32_t ip);
@@ -265,6 +270,15 @@ void handle_client(char *buffer, datos_cliente_t *data) {
         char *filename = comando + 3; // 2 letras "RF" + 1 espacio
         printf("Cliente solicitó leer archivo: %s\n", filename);
         handle_read_file(filename, data);
+        return;
+    } else if (strncmp(comando, "WF", 2) == 0) { //C WF filename
+        char *filename = comando + 3; // 2 letras "WF" + 1 espacio
+        printf("Cliente solicitó escribir archivo: %s\n", filename);
+        handle_write_file(filename, data);
+        return;
+    } else if (strncmp(comando, "WB", 2) == 0) { //C WB filename content
+        printf("Cliente enviando contenido modificado\n");
+        handle_write_back(comando, data);
         return;
     }
     
@@ -821,6 +835,285 @@ void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos
     
     // Lectura completada - no hay locks que manejar
     printf("Lectura del archivo %s completada\n", file_entry->nombre_archivo);
+}
+
+void handle_write_file(char *filename, datos_cliente_t *data) {
+    // Remover salto de línea si existe
+    char *newline = strchr(filename, '\n');
+    if (newline) {
+        *newline = '\0';
+    }
+    
+    pthread_mutex_lock(&tabla_mutex);
+    
+    // Buscar el archivo en la tabla
+    entrada_tabla_archivo *current = tabla_archivos;
+    while (current != NULL) {
+        if (current->nombre_archivo != NULL && igual(current->nombre_archivo, filename)) {
+            // Archivo encontrado
+            
+            if (current->lock == 0) {
+                // Archivo no está bloqueado - bloquear para escritura
+                current->lock = 1;
+                printf("Archivo %s bloqueado para escritura\n", filename);
+                
+                // Agregar cliente al FRENTE de la cola (TOP priority)
+                add_to_waiting_queue_front(current, data);
+                
+                pthread_mutex_unlock(&tabla_mutex);
+                
+                // Solicitar archivo al file server para edición
+                request_file_for_write(current, data);
+                return;
+                
+            } else {
+                // Archivo está bloqueado - agregar a cola de espera
+                printf("Archivo %s ya está bloqueado, agregando cliente a cola de espera\n", filename);
+                add_to_waiting_queue(current, data);
+                
+                pthread_mutex_unlock(&tabla_mutex);
+                
+                char *respuesta = "WAIT: El archivo está siendo utilizado, esperando...";
+                send(data->client_socket, respuesta, strlen(respuesta), 0);
+                return;
+            }
+        }
+        current = current->next;
+    }
+    
+    // Archivo no encontrado
+    pthread_mutex_unlock(&tabla_mutex);
+    char *respuesta = "NOTFOUND: El archivo no existe en el sistema";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+    printf("Cliente solicitó escribir archivo inexistente: %s\n", filename);
+}
+
+void add_to_waiting_queue_front(entrada_tabla_archivo *file_entry, datos_cliente_t *client) {
+    nodo_espera_t *new_node = malloc(sizeof(nodo_espera_t));
+    if (!new_node) {
+        printf("Error: No se pudo asignar memoria para nodo de espera\n");
+        return;
+    }
+    
+    new_node->client_socket = client->client_socket;
+    new_node->client_port = ntohs(client->client_addr.sin_port);
+    
+    // Agregar al FRENTE de la cola (priority)
+    new_node->next = file_entry->cola_espera;
+    file_entry->cola_espera = new_node;
+    
+    printf("Cliente agregado al FRENTE de la cola de espera del archivo %s\n", file_entry->nombre_archivo);
+}
+
+void request_file_for_write(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client) {
+    // Similar a request_file_from_server_read_only pero envía WRITE_CONTENT en lugar de FILE_CONTENT
+    int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (file_server_socket < 0) {
+        printf("Error creando socket para file server\n");
+        char *respuesta = "ERROR: No se pudo crear socket para file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    // Configurar dirección del file server
+    struct sockaddr_in file_server_addr;
+    memset(&file_server_addr, 0, sizeof(file_server_addr));
+    file_server_addr.sin_family = AF_INET;
+    file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
+    file_server_addr.sin_port = htons(file_entry->port);
+    
+    printf("Conectando a file server para escritura en IP: %s, Puerto: %d\n", 
+           inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
+    
+    // Conectar al file server
+    if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
+        printf("Error conectando al file server\n");
+        close(file_server_socket);
+        char *respuesta = "ERROR: No se pudo conectar al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    // Crear mensaje para solicitar el archivo al file server
+    char request_msg[MAX_MSG];
+    sprintf(request_msg, "SF %s", file_entry->nombre_archivo);
+    
+    printf("Solicitando archivo %s para escritura al file server\n", file_entry->nombre_archivo);
+    
+    // Enviar solicitud al file server
+    int bytes_sent = send(file_server_socket, request_msg, strlen(request_msg), 0);
+    if (bytes_sent < 0) {
+        printf("Error enviando solicitud al file server\n");
+        close(file_server_socket);
+        char *respuesta = "ERROR: No se pudo enviar solicitud al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    printf("Solicitud de escritura enviada al file server, esperando respuesta...\n");
+    
+    // Recibir respuesta del file server
+    char response[MAX_MSG];
+    int bytes_received = recv(file_server_socket, response, MAX_MSG - 1, 0);
+    
+    close(file_server_socket);
+    
+    if (bytes_received > 0) {
+        response[bytes_received] = '\0';
+        printf("Respuesta recibida del file server: %s\n", response);
+        
+        if (strncmp(response, "FILE_CONTENT", 12) == 0) {
+            // Extraer filename y contenido
+            char filename[256];
+            char *content_start = NULL;
+            
+            if (sscanf(response, "FILE_CONTENT %255s", filename) == 1) {
+                content_start = strstr(response, filename);
+                if (content_start) {
+                    content_start += strlen(filename) + 1; // +1 para el espacio
+                    
+                    // Enviar contenido al cliente para edición (con formato WRITE_CONTENT)
+                    char response_to_client[MAX_MSG];
+                    snprintf(response_to_client, sizeof(response_to_client), 
+                            "WRITE_CONTENT:%s:%s", filename, content_start);
+                    
+                    send(requesting_client->client_socket, response_to_client, strlen(response_to_client), 0);
+                    printf("Contenido del archivo %s enviado al cliente para edición\n", filename);
+                } else {
+                    printf("Error extrayendo contenido del archivo\n");
+                    char *respuesta = "ERROR: Formato de respuesta inválido";
+                    send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+                }
+            } else {
+                printf("Error extrayendo nombre del archivo\n");
+                char *respuesta = "ERROR: Formato de respuesta inválido";
+                send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+            }
+        } else if (strncmp(response, "FILE_NOT_FOUND", 14) == 0) {
+            printf("File server reporta archivo no encontrado\n");
+            char *respuesta = "ERROR: Archivo no encontrado en file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        } else {
+            printf("Respuesta no reconocida del file server: %s\n", response);
+            char *respuesta = "ERROR: Respuesta no reconocida del file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        }
+    } else {
+        printf("Error recibiendo respuesta del file server\n");
+        char *respuesta = "ERROR: No se recibió respuesta del file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+    }
+    
+    // NO desbloqueamos aquí - el archivo permanece bloqueado hasta que se complete la escritura
+}
+
+void handle_write_back(char *buffer, datos_cliente_t *data) {
+    // Formato esperado: "WB filename content"
+    char filename[256];
+    char *content_start = strstr(buffer, " ");
+    if (!content_start) {
+        char *respuesta = "ERROR: Formato inválido en write back";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    content_start++; // Skip the first space
+    
+    char *second_space = strstr(content_start, " ");
+    if (!second_space) {
+        char *respuesta = "ERROR: Formato inválido en write back";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    // Extract filename
+    int filename_len = second_space - content_start;
+    strncpy(filename, content_start, filename_len);
+    filename[filename_len] = '\0';
+    
+    // Get content after filename
+    char *modified_content = second_space + 1;
+    
+    printf("Recibido contenido modificado para archivo: %s\n", filename);
+    
+    pthread_mutex_lock(&tabla_mutex);
+    
+    // Buscar el archivo en la tabla
+    entrada_tabla_archivo *file_entry = tabla_archivos;
+    while (file_entry != NULL) {
+        if (file_entry->nombre_archivo != NULL && igual(file_entry->nombre_archivo, filename)) {
+            // Archivo encontrado - enviar contenido modificado al file server
+            pthread_mutex_unlock(&tabla_mutex);
+            
+            send_modified_content_to_server(file_entry, modified_content);
+            
+            // Ahora desbloquear archivo y procesar cola
+            pthread_mutex_lock(&tabla_mutex);
+            file_entry->lock = 0;
+            
+            // Remover el cliente actual de la cola (el que está al frente)
+            if (file_entry->cola_espera != NULL) {
+                nodo_espera_t *completed_client = file_entry->cola_espera;
+                file_entry->cola_espera = completed_client->next;
+                free(completed_client);
+                printf("Cliente removido de la cola después de completar escritura\n");
+            }
+            
+            // Procesar siguiente cliente en cola
+            process_next_in_queue(file_entry);
+            pthread_mutex_unlock(&tabla_mutex);
+            
+            char *respuesta = "WRITE_COMPLETE: Archivo guardado exitosamente";
+            send(data->client_socket, respuesta, strlen(respuesta), 0);
+            return;
+        }
+        file_entry = file_entry->next;
+    }
+    
+    pthread_mutex_unlock(&tabla_mutex);
+    char *respuesta = "ERROR: Archivo no encontrado para write back";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+}
+
+void send_modified_content_to_server(entrada_tabla_archivo *file_entry, char *content) {
+    // Crear nuevo socket para conectar al file server
+    int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (file_server_socket < 0) {
+        printf("Error creando socket para file server (write back)\n");
+        return;
+    }
+    
+    // Configurar dirección del file server
+    struct sockaddr_in file_server_addr;
+    memset(&file_server_addr, 0, sizeof(file_server_addr));
+    file_server_addr.sin_family = AF_INET;
+    file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
+    file_server_addr.sin_port = htons(file_entry->port);
+    
+    printf("Conectando a file server para guardar archivo modificado\n");
+    
+    // Conectar al file server
+    if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
+        printf("Error conectando al file server para write back\n");
+        close(file_server_socket);
+        return;
+    }
+    
+    // Crear mensaje para escribir el archivo al file server
+    // Formato: "WF filename content"
+    char write_msg[MAX_MSG];
+    snprintf(write_msg, sizeof(write_msg), "WF %s %s", file_entry->nombre_archivo, content);
+    
+    printf("Enviando contenido modificado al file server: %s\n", file_entry->nombre_archivo);
+    
+    // Enviar contenido modificado al file server
+    int bytes_sent = send(file_server_socket, write_msg, strlen(write_msg), 0);
+    if (bytes_sent < 0) {
+        printf("Error enviando contenido modificado al file server\n");
+    } else {
+        printf("Contenido modificado enviado exitosamente al file server\n");
+    }
+    
+    close(file_server_socket);
 }
 
 

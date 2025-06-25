@@ -29,11 +29,13 @@ void *file_server_listener(void *arg);
 void *handle_fns_request(void *arg);
 void *client_interface_thread(void *arg);
 void send_client_request(char *message);
+void send_write_request(char *message);
 void upload_all_files();
 void upload_file();
 void remove_file();
 void list_files();
 void read_file();
+void write_file();
 void upload(char *filename);
 
 int main(int argc, char *argv[]) {
@@ -206,6 +208,9 @@ void *client_interface_thread(void *arg) {
             case 5:
                 read_file();
                 break;
+            case 6:
+                write_file();
+                break;
             default:
                 printf("Opcion no implementada\n");
                 continue;
@@ -342,6 +347,7 @@ void *handle_fns_request(void *arg) {
         printf("Solicitud del FNS: %s\n", buffer);
         
         if (strncmp(buffer, "SF", 2) == 0) {
+            // Send File - leer archivo y enviarlo
             char filename[256];
             sscanf(buffer, "SF %s", filename);
             
@@ -365,6 +371,47 @@ void *handle_fns_request(void *arg) {
             } else {
                 send(fns_socket, "FILE_NOT_FOUND", 14, 0);
                 printf("Archivo %s no encontrado\n", filename);
+            }
+        } else if (strncmp(buffer, "WF", 2) == 0) {
+            // Write File - recibir contenido y escribir archivo
+            char filename[256];
+            char *content_start = strstr(buffer, " ");
+            if (content_start) {
+                content_start++; // Skip first space
+                char *second_space = strstr(content_start, " ");
+                if (second_space) {
+                    // Extract filename
+                    int filename_len = second_space - content_start;
+                    strncpy(filename, content_start, filename_len);
+                    filename[filename_len] = '\0';
+                    
+                    // Get content
+                    char *file_content = second_space + 1;
+                    
+                    // Construir la ruta completa del archivo en el directorio archivos
+                    char filepath[512];
+                    sprintf(filepath, "archivos/%s", filename);
+                    
+                    printf("Escribiendo archivo: %s\n", filepath);
+                    
+                    FILE *file = fopen(filepath, "w");
+                    if (file) {
+                        fprintf(file, "%s", file_content);
+                        fclose(file);
+                        
+                        send(fns_socket, "WRITE_SUCCESS", 13, 0);
+                        printf("Archivo %s escrito exitosamente\n", filename);
+                    } else {
+                        send(fns_socket, "WRITE_ERROR", 11, 0);
+                        printf("Error escribiendo archivo %s\n", filename);
+                    }
+                } else {
+                    send(fns_socket, "WRITE_ERROR", 11, 0);
+                    printf("Error: Formato inválido en comando WF\n");
+                }
+            } else {
+                send(fns_socket, "WRITE_ERROR", 11, 0);
+                printf("Error: Formato inválido en comando WF\n");
             }
         }
     }
@@ -472,4 +519,106 @@ void read_file() {
     char command[MAX_MSG];
     sprintf(command, "C RF %s", filename);
     send_client_request(command);
+}
+
+void write_file() {
+    char filename[256];
+    printf("Ingrese el nombre del archivo a escribir: ");
+    scanf("%s", filename);
+
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+
+    strncpy(last_requested_file, filename, sizeof(last_requested_file) - 1);
+    last_requested_file[sizeof(last_requested_file) - 1] = '\0';
+    
+    char command[MAX_MSG];
+    sprintf(command, "C WF %s", filename);
+    send_write_request(command);
+}
+
+void send_write_request(char *message) {
+    printf("Enviando solicitud de escritura: %s\n", message);
+    send(client_state.client_socket, message, strlen(message), 0);
+    
+    char respuesta[MAX_MSG];
+    int bytes = recv(client_state.client_socket, respuesta, MAX_MSG - 1, 0);
+    if (bytes > 0) {
+        respuesta[bytes] = '\0';
+        
+        if (strncmp(respuesta, "WRITE_CONTENT:", 14) == 0) {
+            char received_filename[256];
+            char *content_start = NULL;
+            
+            char *first_colon = strchr(respuesta + 14, ':');
+            if (first_colon) {
+                *first_colon = '\0';
+                strncpy(received_filename, respuesta + 14, sizeof(received_filename) - 1);
+                received_filename[sizeof(received_filename) - 1] = '\0';
+                *first_colon = ':';
+                content_start = first_colon + 1;
+                
+                char temp_filename[300];
+                sprintf(temp_filename, "%s.tmp", received_filename);
+                
+                FILE *temp_file = fopen(temp_filename, "w");
+                if (temp_file) {
+                    fprintf(temp_file, "%s", content_start);
+                    fclose(temp_file);
+                    
+                    printf("Abriendo editor para %s...\n", received_filename);
+                    printf("Contenido actual:\n");
+                    printf("====================\n");
+                    printf("%s", content_start);
+                    printf("\n====================\n");
+                    
+                    char editor_command[400];
+                    sprintf(editor_command, "vi %s", temp_filename);
+                    int result = system(editor_command);
+                    
+                    if (result == 0) {
+                        FILE *modified_file = fopen(temp_filename, "r");
+                        if (modified_file) {
+                            char modified_content[MAX_MSG];
+                            size_t read_size = fread(modified_content, 1, MAX_MSG - 1, modified_file);
+                            modified_content[read_size] = '\0';
+                            fclose(modified_file);
+                            
+                            char write_back_command[MAX_MSG];
+                            sprintf(write_back_command, "C WB %s %s", received_filename, modified_content);
+                            
+                            printf("Enviando contenido modificado...\n");
+                            send(client_state.client_socket, write_back_command, strlen(write_back_command), 0);
+                            
+                            char confirm_response[MAX_MSG];
+                            int confirm_bytes = recv(client_state.client_socket, confirm_response, MAX_MSG - 1, 0);
+                            if (confirm_bytes > 0) {
+                                confirm_response[confirm_bytes] = '\0';
+                                printf("Respuesta del servidor: %s\n", confirm_response);
+                            }
+                            
+                            unlink(temp_filename);
+                        } else {
+                            printf("Error: No se pudo leer el archivo modificado\n");
+                        }
+                    } else {
+                        printf("Error: Editor cerrado sin guardar o con error\n");
+                        unlink(temp_filename);
+                    }
+                } else {
+                    printf("Error: No se pudo crear archivo temporal\n");
+                }
+            } else {
+                printf("Error: Formato de respuesta WRITE_CONTENT inválido\n");
+            }
+        } else if (strncmp(respuesta, "WAIT:", 5) == 0) {
+            printf("%s\n", respuesta + 6); // Skip "WAIT: "
+        } else if (strncmp(respuesta, "NOTFOUND:", 9) == 0) {
+            printf("%s\n", respuesta + 10); // Skip "NOTFOUND: "
+        } else if (strncmp(respuesta, "ERROR:", 6) == 0) {
+            printf("%s\n", respuesta + 7); // Skip "ERROR: "
+        } else {
+            printf("Respuesta del servidor: %s\n", respuesta);
+        }
+    }
 }
