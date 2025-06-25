@@ -53,6 +53,7 @@ int search_file(char *file_name);
 void add_file_to_table(char *file_name, datos_cliente_t *data);
 void print_file_table();
 void print_file_table_unlocked();
+void remove_file_from_table(char *filename, datos_cliente_t *data);
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -205,6 +206,11 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
         char *filename = comando + 3; // 2 letras y 1 espacio
         printf("Registrando archivo: %s\n", filename);
         add_file(filename, data); // solo nombre del archivo
+    } else if (igual(accion, "RF")) {
+        char *filename = comando + 3; // 2 letras y 1 espacio
+        printf("Solicitando eliminar archivo: %s\n", filename);
+        remove_file_from_table(filename, data);
+        return; // remove_file_from_table envía su propia respuesta
     }
 
     char *respuesta = "OK";
@@ -371,5 +377,82 @@ void print_file_table_unlocked() {
     }
     
     printf("=========================\n\n");
+}
+
+void remove_file_from_table(char *filename, datos_cliente_t *data) {
+    // Remover salto de línea si existe
+    char *newline = strchr(filename, '\n');
+    if (newline) {
+        *newline = '\0';
+    }
+    
+    pthread_mutex_lock(&tabla_mutex);
+    
+    if (tabla_archivos == NULL) {
+        pthread_mutex_unlock(&tabla_mutex);
+        char *respuesta = "ERROR: No hay archivos registrados";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    entrada_tabla_archivo *current = tabla_archivos;
+    entrada_tabla_archivo *previous = NULL;
+    
+    // Buscar el archivo en la tabla
+    while (current != NULL) {
+        if (current->nombre_archivo != NULL && igual(current->nombre_archivo, filename)) {
+            // Archivo encontrado, verificar condiciones para eliminarlo
+            
+            if (current->lock != 0) {
+                pthread_mutex_unlock(&tabla_mutex);
+                char *respuesta = "ERROR: El archivo está bloqueado, no se puede eliminar";
+                send(data->client_socket, respuesta, strlen(respuesta), 0);
+                printf("Intento de eliminar archivo bloqueado: %s\n", filename);
+                return;
+            }
+            
+            if (current->tabla_registros != NULL) {
+                pthread_mutex_unlock(&tabla_mutex);
+                char *respuesta = "ERROR: El archivo tiene registros activos, no se puede eliminar";
+                send(data->client_socket, respuesta, strlen(respuesta), 0);
+                printf("Intento de eliminar archivo con registros activos: %s\n", filename);
+                return;
+            }
+            
+            // Condiciones cumplidas, eliminar el archivo
+            if (previous == NULL) {
+                // Es el primer nodo de la lista
+                tabla_archivos = current->next;
+            } else {
+                // No es el primer nodo
+                previous->next = current->next;
+            }
+            
+            printf("Archivo eliminado de la tabla: %s\n", filename);
+            
+            // Liberar memoria
+            free(current->nombre_archivo);
+            pthread_mutex_destroy(&current->page_mutex);
+            free(current);
+            
+            // Imprimir tabla actualizada
+            print_file_table_unlocked();
+            
+            pthread_mutex_unlock(&tabla_mutex);
+            
+            char *respuesta = "ARCHIVO_ELIMINADO";
+            send(data->client_socket, respuesta, strlen(respuesta), 0);
+            return;
+        }
+        
+        previous = current;
+        current = current->next;
+    }
+    
+    // Archivo no encontrado
+    pthread_mutex_unlock(&tabla_mutex);
+    char *respuesta = "ERROR: Archivo no encontrado";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+    printf("Intento de eliminar archivo inexistente: %s\n", filename);
 }
 

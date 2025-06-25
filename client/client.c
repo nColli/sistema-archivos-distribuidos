@@ -261,11 +261,26 @@ void upload_file() {
     char filename[256];
     printf("Ingrese el nombre del archivo a subir (con extension): ");
     scanf("%s", filename);
+    
+    // Limpiar el buffer de entrada
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+    
     upload(filename);
 }
 
 void remove_file() {
-    printf("Eliminando archivo de FNS\n");
+    char filename[256];
+    printf("Ingrese el nombre del archivo a eliminar: ");
+    scanf("%s", filename);
+    
+    // Limpiar el buffer de entrada
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+    
+    char command[MAX_MSG];
+    sprintf(command, "F RF %s", filename);
+    send_client_request(command);
 }
 
 void list_files() {
