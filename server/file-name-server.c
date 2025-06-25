@@ -25,7 +25,6 @@ typedef struct {
 
 typedef struct entrada_tabla_archivo {
     char *nombre_archivo;
-    char *contenido;
     int ip;
     int port;
     int lock;
@@ -51,7 +50,9 @@ void handle_client(char *buffer, datos_cliente_t *data);
 int igual(char *str1, char *str2);
 void add_file(char *archivo_contenido, datos_cliente_t *data);
 int search_file(char *file_name);
-void add_file_to_table(char *file_name, char *contenido, datos_cliente_t *data);
+void add_file_to_table(char *file_name, datos_cliente_t *data);
+void print_file_table();
+void print_file_table_unlocked();
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -200,11 +201,10 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
         return;
     }
 
-    char *archivo_contenido = comando + 3; //2 letras y 1 espacio
-    
     if (igual(accion, "AF")) {
-        printf("Archivo y contenido: %s\n", archivo_contenido);
-        add_file(archivo_contenido, data); //nombre.txt contenido
+        char *filename = comando + 3; // 2 letras y 1 espacio
+        printf("Registrando archivo: %s\n", filename);
+        add_file(filename, data); // solo nombre del archivo
     }
 
     char *respuesta = "OK";
@@ -254,45 +254,33 @@ int search_file(char *file_name) {
         current = current->next;
     }
     
-    return -1; // archivo encontrado
+    return -1; // archivo no encontrado
 }
 
-void add_file(char *archivo_contenido, datos_cliente_t *data) {
-    char *space_pos = strchr(archivo_contenido, ' ');
-    if (space_pos == NULL) {
-        printf("Error: No se encontró espacio en archivo_contenido\n");
-        return;
+void add_file(char *filename, datos_cliente_t *data) {
+    // Remover salto de línea si existe
+    char *newline = strchr(filename, '\n');
+    if (newline) {
+        *newline = '\0';
     }
     
-    int filename_length = space_pos - archivo_contenido;
-
-    char *file_name = malloc(filename_length + 1);
-    if (file_name == NULL) {
-        printf("Error: No se pudo asignar memoria para file_name\n");
-        return;
-    }
+    printf("Archivo: %s\n", filename);
     
-    strncpy(file_name, archivo_contenido, filename_length);
-    file_name[filename_length] = '\0';
+    pthread_mutex_lock(&tabla_mutex);
     
-    char *contenido = space_pos + 1;
-    
-    printf("Archivo: %s\n", file_name);
-    printf("Contenido: %s\n", contenido);
-    
-    int archivo_encontrado = search_file(file_name);
+    int archivo_encontrado = search_file(filename);
 
     if (archivo_encontrado == -1) {
         printf("Agregando archivo a tabla\n");
-        add_file_to_table(file_name, contenido, data);
+        add_file_to_table(filename, data);
+        pthread_mutex_unlock(&tabla_mutex);
     } else {
         printf("Archivo repetido\n");
+        pthread_mutex_unlock(&tabla_mutex);
     }
-
-    free(file_name);
 }
 
-void add_file_to_table(char *file_name, char *contenido, datos_cliente_t *data) {
+void add_file_to_table(char *file_name, datos_cliente_t *data) {
     entrada_tabla_archivo *nuevo = malloc(sizeof(entrada_tabla_archivo));
     if (nuevo == NULL) {
         printf("Error: No se pudo asignar memoria para nuevo archivo\n");
@@ -329,7 +317,6 @@ void add_file_to_table(char *file_name, char *contenido, datos_cliente_t *data) 
     nuevo->tabla_registros = NULL;
     nuevo->next = NULL;
 
-    pthread_mutex_lock(&tabla_mutex);
     if (tabla_archivos == NULL) {
         tabla_archivos = nuevo;
     } else {
@@ -339,7 +326,50 @@ void add_file_to_table(char *file_name, char *contenido, datos_cliente_t *data) 
         }
         actual->next = nuevo;
     }
-    pthread_mutex_unlock(&tabla_mutex);
 
     printf("Archivo '%s' agregado a la tabla con IP: %s, Puerto: %d\n", file_name, client_ip, nuevo->port);
+    
+    // Imprimir la tabla actualizada (mutex ya está bloqueado)
+    print_file_table_unlocked();
 }
+
+void print_file_table() {
+    pthread_mutex_lock(&tabla_mutex);
+    print_file_table_unlocked();
+    pthread_mutex_unlock(&tabla_mutex);
+}
+
+void print_file_table_unlocked() {
+    printf("\n=== TABLA DE ARCHIVOS ===\n");
+    printf("%-20s %-15s %-10s %-10s\n", "ARCHIVO", "IP", "PUERTO", "LOCK");
+    printf("--------------------------------------------------------\n");
+    
+    if (tabla_archivos == NULL) {
+        printf("No hay archivos registrados.\n");
+    } else {
+        entrada_tabla_archivo *current = tabla_archivos;
+        int contador = 1;
+        
+        while (current != NULL) {
+            // Convertir IP de formato numérico a string
+            struct in_addr addr;
+            addr.s_addr = htonl(current->ip);
+            char ip_str[16];
+            inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+            
+            printf("%-20s %-15s %-10d %-10s\n", 
+                   current->nombre_archivo, 
+                   ip_str, 
+                   current->port,
+                   current->lock ? "SI" : "NO");
+            
+            current = current->next;
+            contador++;
+        }
+        printf("--------------------------------------------------------\n");
+        printf("Total de archivos: %d\n", contador - 1);
+    }
+    
+    printf("=========================\n\n");
+}
+

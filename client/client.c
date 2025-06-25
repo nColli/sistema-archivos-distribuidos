@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <dirent.h>
 #define MAX_MSG 1024
 
 typedef struct {
@@ -22,6 +23,11 @@ void print_menu();
 void *listen_for_fns_requests(void *arg);
 void send_client_request(char *message);
 void handle_fns_request(char *buffer);
+void upload_all_files();
+void upload_file();
+void remove_file();
+void list_files();
+void upload(char *filename);
 
 int main(int argc, char *argv[]) {
     char opcion[10];
@@ -48,6 +54,28 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    // Permitir reutilizar la dirección
+    int opt = 1;
+    if (setsockopt(client_state.socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt fallo");
+        close(client_state.socket);
+        exit(1);
+    }
+
+    // Bind al puerto especificado por el cliente
+    struct sockaddr_in client_addr;
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sin_family = AF_INET;
+    client_addr.sin_addr.s_addr = INADDR_ANY;
+    client_addr.sin_port = htons(client_state.client_port);
+    
+    if (bind(client_state.socket, (struct sockaddr*)&client_addr, sizeof(client_addr)) < 0) {
+        printf("Error al hacer bind en puerto %d\n", client_state.client_port);
+        close(client_state.socket);
+        exit(1);
+    }
+
+    // Configurar dirección del servidor
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -90,29 +118,22 @@ int main(int argc, char *argv[]) {
 
         switch(atoi(opcion)) {
             case 1:
-                strcpy(mensaje, "F AF upload_all_files");
+                upload_all_files();
                 break;
             case 2:
-                printf("Nombre del archivo: ");
-                fgets(mensaje, sizeof(mensaje), stdin);
-                mensaje[strcspn(mensaje, "\n")] = 0;
+                upload_file();
                 break;
             case 3:
-                printf("Nombre del archivo a bajar: ");
-                char filename[256];
-                fgets(filename, sizeof(filename), stdin);
-                filename[strcspn(filename, "\n")] = 0;
-                sprintf(mensaje, "C DOWNLOAD %s", filename);
+                remove_file();
                 break;
             case 4:
-                strcpy(mensaje, "C LIST");
+                list_files();
                 break;
             default:
                 printf("Opcion no implementada\n");
                 continue;
         }
 
-        send_client_request(mensaje);
         print_menu();
     }
 
@@ -164,7 +185,11 @@ void handle_fns_request(char *buffer) {
         char filename[256];
         sscanf(buffer, "SEND_FILE %s", filename);
         
-        FILE *file = fopen(filename, "r");
+        // Construir la ruta completa del archivo en el directorio archivos
+        char filepath[512];
+        sprintf(filepath, "archivos/%s", filename);
+        
+        FILE *file = fopen(filepath, "r");
         if (file) {
             char file_content[MAX_MSG];
             size_t read_size = fread(file_content, 1, MAX_MSG - 1, file);
@@ -174,8 +199,10 @@ void handle_fns_request(char *buffer) {
             char response[MAX_MSG];
             sprintf(response, "FILE_CONTENT %s %s", filename, file_content);
             send(client_state.socket, response, strlen(response), 0);
+            printf("Enviado contenido del archivo %s al FNS\n", filename);
         } else {
             send(client_state.socket, "FILE_NOT_FOUND", 14, 0);
+            printf("Archivo %s no encontrado\n", filename);
         }
     }
 }
@@ -185,13 +212,62 @@ void print_menu() {
     printf("0. Salir\n");
     printf("1. Subir todos los archivos a FNS\n");
     printf("2. Subir archivo\n");
-    printf("3. Bajar archivo\n");
+    printf("3. Eliminar archivo\n");
     printf("4. Listar archivos disponibles\n");
     printf("5. Leer archivo\n");
     printf("6. Escribir archivo\n");
     printf("7. Descargar archivo\n");
     printf("8. Leer registro\n");
     printf("9. Escribir registro\n");
-    printf("Seleccione una opción: ");
 }
 
+void upload(char *filename) {
+    char filepath[512];
+    sprintf(filepath, "archivos/%s", filename);
+    
+    // Verificar que el archivo existe antes de registrarlo
+    FILE *file = fopen(filepath, "r");
+    if (file) {
+        fclose(file);
+        
+        // Enviar solo el nombre del archivo para registrarlo
+        char command[MAX_MSG];
+        sprintf(command, "F AF %s", filename);
+        send_client_request(command);
+        
+        printf("Archivo %s registrado exitosamente en FNS\n", filename);
+    } else {
+        printf("No se pudo abrir el archivo %s\n", filename);
+    }
+}
+
+void upload_all_files() {
+    printf("Subiendo todos los archivos a FNS\n");
+    DIR *dir = opendir("archivos");
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type == DT_REG || entry->d_type == DT_LNK) {
+                char filename[256];
+                snprintf(filename, sizeof(filename), "%s", entry->d_name);
+                upload(filename);
+            }
+        }
+        closedir(dir);
+    }
+}
+
+void upload_file() {
+    char filename[256];
+    printf("Ingrese el nombre del archivo a subir (con extension): ");
+    scanf("%s", filename);
+    upload(filename);
+}
+
+void remove_file() {
+    printf("Eliminando archivo de FNS\n");
+}
+
+void list_files() {
+    printf("Listando archivos disponibles en FNS\n");
+}
