@@ -65,10 +65,12 @@ void print_file_table_unlocked();
 void remove_file_from_table(char *filename, datos_cliente_t *data);
 void send_file_list(datos_cliente_t *data);
 void handle_read_file(char *filename, datos_cliente_t *data);
+void handle_read_record(char *buffer, datos_cliente_t *data);
 void handle_write_file(char *filename, datos_cliente_t *data);
 void handle_write_back(char *buffer, datos_cliente_t *data);
 void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
 void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
+void request_record_from_server(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *requesting_client);
 void request_file_for_write(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
 void send_modified_content_to_server(entrada_tabla_archivo *file_entry, char *content);
 void add_to_waiting_queue(entrada_tabla_archivo *file_entry, datos_cliente_t *client);
@@ -270,6 +272,10 @@ void handle_client(char *buffer, datos_cliente_t *data) {
         char *filename = comando + 3; // 2 letras "RF" + 1 espacio
         printf("Cliente solicitó leer archivo: %s\n", filename);
         handle_read_file(filename, data);
+        return;
+    } else if (strncmp(comando, "RR", 2) == 0) {
+        printf("Cliente solicitó leer registro\n");
+        handle_read_record(comando, data);
         return;
     } else if (strncmp(comando, "WF", 2) == 0) { //C WF filename
         char *filename = comando + 3; // 2 letras "WF" + 1 espacio
@@ -837,6 +843,46 @@ void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos
     printf("Lectura del archivo %s completada\n", file_entry->nombre_archivo);
 }
 
+void handle_read_record(char *buffer, datos_cliente_t *data) {
+    char filename[256];
+    int record_number;
+    
+    if (sscanf(buffer, "RR %255s %d", filename, &record_number) != 2) {
+        char *respuesta = "ERROR: Formato inválido en solicitud de registro";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        printf("Error: Formato inválido en comando RR\n");
+        return;
+    }
+    
+    if (record_number <= 0) {
+        char *respuesta = "ERROR: El número de registro debe ser mayor a 0";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        printf("Error: Número de registro inválido: %d\n", record_number);
+        return;
+    }
+    
+    pthread_mutex_lock(&tabla_mutex);
+    
+    // Buscar el archivo en la tabla
+    entrada_tabla_archivo *current = tabla_archivos;
+    while (current != NULL) {
+        if (current->nombre_archivo != NULL && igual(current->nombre_archivo, filename)) {
+            printf("Solicitud de lectura de registro %d para archivo %s\n", record_number, filename);
+            
+            pthread_mutex_unlock(&tabla_mutex);
+            
+            request_record_from_server(current, record_number, data);
+            return;
+        }
+        current = current->next;
+    }
+    
+    pthread_mutex_unlock(&tabla_mutex);
+    char *respuesta = "NOTFOUND: El archivo no existe en el sistema";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+    printf("Cliente solicitó registro de archivo inexistente: %s\n", filename);
+}
+
 void handle_write_file(char *filename, datos_cliente_t *data) {
     // Remover salto de línea si existe
     char *newline = strchr(filename, '\n');
@@ -905,6 +951,82 @@ void add_to_waiting_queue_front(entrada_tabla_archivo *file_entry, datos_cliente
     file_entry->cola_espera = new_node;
     
     printf("Cliente agregado al FRENTE de la cola de espera del archivo %s\n", file_entry->nombre_archivo);
+}
+
+void request_record_from_server(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *requesting_client) {
+    int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (file_server_socket < 0) {
+        printf("Error creando socket para file server\n");
+        char *respuesta = "ERROR: No se pudo crear socket para file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    struct sockaddr_in file_server_addr;
+    memset(&file_server_addr, 0, sizeof(file_server_addr));
+    file_server_addr.sin_family = AF_INET;
+    file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
+    file_server_addr.sin_port = htons(file_entry->port);
+    
+    printf("Conectando a file server para leer registro en IP: %s, Puerto: %d\n", 
+           inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
+    
+    if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
+        printf("Error conectando al file server\n");
+        close(file_server_socket);
+        char *respuesta = "ERROR: No se pudo conectar al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    char request_msg[MAX_MSG];
+    sprintf(request_msg, "SR %s %d", file_entry->nombre_archivo, record_number);
+    
+    printf("Solicitando registro %d del archivo %s al file server\n", record_number, file_entry->nombre_archivo);
+    
+    int bytes_sent = send(file_server_socket, request_msg, strlen(request_msg), 0);
+    if (bytes_sent < 0) {
+        printf("Error enviando solicitud al file server\n");
+        close(file_server_socket);
+        char *respuesta = "ERROR: No se pudo enviar solicitud al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    printf("Solicitud de registro enviada al file server, esperando respuesta...\n");
+    
+    char response[MAX_MSG];
+    int bytes_received = recv(file_server_socket, response, MAX_MSG - 1, 0);
+    
+    close(file_server_socket);
+    
+    if (bytes_received > 0) {
+        response[bytes_received] = '\0';
+        printf("Respuesta recibida del file server: %s\n", response);
+        
+        if (strncmp(response, "RECORD_CONTENT", 14) == 0) {
+            send(requesting_client->client_socket, response, strlen(response), 0);
+            printf("Registro %d del archivo %s enviado al cliente\n", record_number, file_entry->nombre_archivo);
+        } else if (strncmp(response, "RECORD_NOT_FOUND", 16) == 0) {
+            printf("File server reporta registro no encontrado\n");
+            char *respuesta = "ERROR: Registro no encontrado en el archivo";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        } else if (strncmp(response, "FILE_NOT_FOUND", 14) == 0) {
+            printf("File server reporta archivo no encontrado\n");
+            char *respuesta = "ERROR: Archivo no encontrado en file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        } else {
+            printf("Respuesta no reconocida del file server: %s\n", response);
+            char *respuesta = "ERROR: Respuesta no reconocida del file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        }
+    } else {
+        printf("Error recibiendo respuesta del file server\n");
+        char *respuesta = "ERROR: No se recibió respuesta del file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+    }
+    
+    printf("Lectura del registro %d del archivo %s completada\n", record_number, file_entry->nombre_archivo);
 }
 
 void request_file_for_write(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client) {

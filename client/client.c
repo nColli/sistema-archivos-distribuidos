@@ -35,6 +35,7 @@ void upload_file();
 void remove_file();
 void list_files();
 void read_file();
+void read_record();
 void write_file();
 void upload(char *filename);
 
@@ -211,6 +212,9 @@ void *client_interface_thread(void *arg) {
             case 6:
                 write_file();
                 break;
+            case 7:
+                read_record();
+                break;
             default:
                 printf("Opcion no implementada\n");
                 continue;
@@ -266,6 +270,35 @@ void send_client_request(char *message) {
                 }
             } else {
                 printf("Error: Formato de respuesta FILE_CONTENT inválido\n");
+            }
+        } else if (strncmp(respuesta, "RECORD_CONTENT:", 15) == 0) {
+            char received_filename[256];
+            int record_number;
+            char *content_start = NULL;
+            
+            char *first_colon = strchr(respuesta + 15, ':');
+            if (first_colon) {
+                *first_colon = '\0';
+                strncpy(received_filename, respuesta + 15, sizeof(received_filename) - 1);
+                received_filename[sizeof(received_filename) - 1] = '\0';
+                *first_colon = ':';
+                
+                char *second_colon = strchr(first_colon + 1, ':');
+                if (second_colon) {
+                    record_number = atoi(first_colon + 1);
+                    content_start = second_colon + 1;
+                    
+                    printf("\n=== REGISTRO %d DEL ARCHIVO: %s ===\n", record_number, received_filename);
+                    printf("%s", content_start);
+                    if (content_start[strlen(content_start) - 1] != '\n') {
+                        printf("\n");
+                    }
+                    printf("=====================================\n");
+                } else {
+                    printf("Error: Formato de respuesta RECORD_CONTENT inválido (falta segundo :)\n");
+                }
+            } else {
+                printf("Error: Formato de respuesta RECORD_CONTENT inválido (falta primer :)\n");
             }
         } else if (strncmp(respuesta, "FILE_READY:", 11) == 0) {
             printf("Archivo descargado exitosamente\n");
@@ -373,6 +406,56 @@ void *handle_fns_request(void *arg) {
                 printf("Archivo %s no encontrado\n", filename);
             }
             printf("====================================\n");
+        } else if (strncmp(buffer, "SR", 2) == 0) {
+            char filename[256];
+            int record_number;
+            
+            if (sscanf(buffer, "SR %255s %d", filename, &record_number) != 2) {
+                send(fns_socket, "RECORD_ERROR", 12, 0);
+                printf("Error: Formato inválido en comando SR\n");
+                printf("====================================\n");
+                return NULL;
+            }
+            
+            char filepath[512];
+            sprintf(filepath, "archivos/%s", filename);
+            
+            printf("Buscando registro %d del archivo: %s\n", record_number, filepath);
+            
+            FILE *file = fopen(filepath, "r");
+            if (file) {
+                char line[MAX_MSG];
+                int current_line = 1;
+                int found = 0;
+                
+                while (fgets(line, sizeof(line), file) && current_line <= record_number) {
+                    if (current_line == record_number) {
+                        found = 1;
+                        
+                        size_t len = strlen(line);
+                        if (len > 0 && line[len-1] == '\n') {
+                            line[len-1] = '\0';
+                        }
+                        
+                        char response[MAX_MSG];
+                        sprintf(response, "RECORD_CONTENT:%s:%d:%s", filename, record_number, line);
+                        send(fns_socket, response, strlen(response), 0);
+                        printf("Enviado registro %d del archivo %s al FNS\n", record_number, filename);
+                        break;
+                    }
+                    current_line++;
+                }
+                fclose(file);
+                
+                if (!found) {
+                    send(fns_socket, "RECORD_NOT_FOUND", 16, 0);
+                    printf("Registro %d no encontrado en archivo %s\n", record_number, filename);
+                }
+            } else {
+                send(fns_socket, "FILE_NOT_FOUND", 14, 0);
+                printf("Archivo %s no encontrado\n", filename);
+            }
+            printf("====================================\n");
         } else if (strncmp(buffer, "WF", 2) == 0) {
             // Write File - recibir contenido y escribir archivo
             char filename[256];
@@ -431,11 +514,10 @@ void print_menu() {
     printf("2. Subir archivo\n");
     printf("3. Eliminar archivo\n");
     printf("4. Listar archivos disponibles\n");
-    printf("5. Leer archivo\n");
+    printf("5. Leer y descargar archivo\n");
     printf("6. Escribir archivo\n");
-    printf("7. Descargar archivo\n");
-    printf("8. Leer registro\n");
-    printf("9. Escribir registro\n");
+    printf("7. Leer registro\n");
+    printf("8. Escribir registro\n");
 }
 
 void upload(char *filename) {
@@ -522,6 +604,33 @@ void read_file() {
     
     char command[MAX_MSG];
     sprintf(command, "C RF %s", filename);
+    send_client_request(command);
+}
+
+void read_record() {
+    char filename[256];
+    int record_number;
+    
+    printf("Ingrese el nombre del archivo: ");
+    scanf("%s", filename);
+    
+    printf("Ingrese el número de registro a leer: ");
+    scanf("%d", &record_number);
+    
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+    
+    if (record_number <= 0) {
+        printf("Error: El número de registro debe ser mayor a 0\n");
+        print_menu();
+        return;
+    }
+    
+    strncpy(last_requested_file, filename, sizeof(last_requested_file) - 1);
+    last_requested_file[sizeof(last_requested_file) - 1] = '\0';
+    
+    char command[MAX_MSG];
+    sprintf(command, "C RR %s %d", filename, record_number);
     send_client_request(command);
 }
 
