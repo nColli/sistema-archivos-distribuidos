@@ -39,10 +39,19 @@ typedef struct {
     struct sockaddr_in client_addr;
 } datos_cliente_t;
 
+// Estructura para mantener registro de file servers
+typedef struct registered_file_server {
+    uint32_t ip;
+    int file_server_port;
+    struct registered_file_server *next;
+} registered_file_server_t;
+
 //Variables globales
 int server_socket, port;
 entrada_tabla_archivo *tabla_archivos = NULL; // Head of the linked list
+registered_file_server_t *file_servers = NULL; // Lista de file servers registrados
 pthread_mutex_t tabla_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t file_servers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void *handle_conexion(void *arg);
 void handle_file_server(char *buffer, datos_cliente_t *data);
@@ -55,6 +64,13 @@ void print_file_table();
 void print_file_table_unlocked();
 void remove_file_from_table(char *filename, datos_cliente_t *data);
 void send_file_list(datos_cliente_t *data);
+void handle_read_file(char *filename, datos_cliente_t *data);
+void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
+void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
+void add_to_waiting_queue(entrada_tabla_archivo *file_entry, datos_cliente_t *client);
+void process_next_in_queue(entrada_tabla_archivo *file_entry);
+void register_file_server(uint32_t ip, int file_server_port);
+int find_file_server_port(uint32_t ip);
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -192,11 +208,23 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
         // Register Server - registrar este cliente como file server
         printf("Registrando cliente como file server\n");
         
+        // Extraer el puerto del file server del mensaje
+        int file_server_port = 0;
+        if (sscanf(comando, "RS %d", &file_server_port) != 1) {
+            printf("Error: Formato inválido en registro de file server\n");
+            char *respuesta = "ERROR: Formato de registro inválido";
+            send(data->client_socket, respuesta, strlen(respuesta), 0);
+            return;
+        }
+        
         char client_ip[16];
         inet_ntop(AF_INET, &data->client_addr.sin_addr, client_ip, sizeof(client_ip));
-        int client_port = ntohs(data->client_addr.sin_port);
         
-        printf("File Server registrado - IP: %s, Puerto: %d\n", client_ip, client_port);
+        printf("File Server registrado - IP: %s, Puerto File Server: %d, Puerto Cliente: %d\n", 
+               client_ip, file_server_port, ntohs(data->client_addr.sin_port));
+        
+        // Registrar el file server
+        register_file_server(data->client_addr.sin_addr.s_addr, file_server_port);
         
         char *respuesta = "REGISTERED_AS_FILE_SERVER";
         send(data->client_socket, respuesta, strlen(respuesta), 0);
@@ -232,6 +260,11 @@ void handle_client(char *buffer, datos_cliente_t *data) {
     } else if (strncmp(comando, "LF", 2) == 0) { //C LF
         printf("Cliente solicitó lista de archivos\n");
         send_file_list(data);
+        return;
+    } else if (strncmp(comando, "RF", 2) == 0) { //C RF filename
+        char *filename = comando + 3; // 2 letras "RF" + 1 espacio
+        printf("Cliente solicitó leer archivo: %s\n", filename);
+        handle_read_file(filename, data);
         return;
     }
     
@@ -307,21 +340,22 @@ void add_file_to_table(char *file_name, datos_cliente_t *data) {
 
     char client_ip[16];
     inet_ntop(AF_INET, &data->client_addr.sin_addr, client_ip, sizeof(client_ip));
-    int client_port = ntohs(data->client_addr.sin_port);
     
-    struct sockaddr_in local_addr;
-    socklen_t local_len = sizeof(local_addr);
-    int server_local_port = 0;
-    if (getsockname(data->client_socket, (struct sockaddr*)&local_addr, &local_len) == 0) {
-        server_local_port = ntohs(local_addr.sin_port);
+    // Buscar el file server port registrado para esta IP
+    int file_server_port = find_file_server_port(data->client_addr.sin_addr.s_addr);
+    if (file_server_port == -1) {
+        printf("Error: No se encontró file server registrado para esta IP\n");
+        free(nuevo->nombre_archivo);
+        free(nuevo);
+        return;
     }
     
     printf("DEBUG - IP del cliente: %s\n", client_ip);
-    printf("DEBUG - Puerto origen del cliente: %d\n", client_port);
-    printf("DEBUG - Puerto local del servidor: %d\n", server_local_port);
+    printf("DEBUG - Puerto file server: %d\n", file_server_port);
+    printf("DEBUG - Puerto origen del cliente: %d\n", ntohs(data->client_addr.sin_port));
 
     nuevo->ip = ntohl(data->client_addr.sin_addr.s_addr);
-    nuevo->port = client_port; 
+    nuevo->port = file_server_port;  // Usar file server port, no client port
     nuevo->lock = 0;
     pthread_mutex_init(&nuevo->page_mutex, NULL);
     nuevo->cola_espera = NULL;
@@ -338,7 +372,7 @@ void add_file_to_table(char *file_name, datos_cliente_t *data) {
         actual->next = nuevo;
     }
 
-    printf("Archivo '%s' agregado a la tabla con IP: %s, Puerto: %d\n", file_name, client_ip, nuevo->port);
+    printf("Archivo '%s' agregado a la tabla con IP: %s, Puerto File Server: %d\n", file_name, client_ip, nuevo->port);
     
     // Imprimir la tabla actualizada (mutex ya está bloqueado)
     print_file_table_unlocked();
@@ -500,5 +534,367 @@ void send_file_list(datos_cliente_t *data) {
     
     printf("Enviando lista de %d archivos al cliente\n", count);
     send(data->client_socket, response, strlen(response), 0);
+}
+
+void handle_read_file(char *filename, datos_cliente_t *data) {
+    // Remover salto de línea si existe
+    char *newline = strchr(filename, '\n');
+    if (newline) {
+        *newline = '\0';
+    }
+    
+    pthread_mutex_lock(&tabla_mutex);
+    
+    // Buscar el archivo en la tabla
+    entrada_tabla_archivo *current = tabla_archivos;
+    while (current != NULL) {
+        if (current->nombre_archivo != NULL && igual(current->nombre_archivo, filename)) {
+            // Archivo encontrado - leer inmediatamente sin bloqueo
+            printf("Solicitud de lectura para archivo %s (sin bloqueo)\n", filename);
+            
+            pthread_mutex_unlock(&tabla_mutex);
+            
+            // Solicitar archivo al file server inmediatamente
+            request_file_from_server_read_only(current, data);
+            return;
+        }
+        current = current->next;
+    }
+    
+    // Archivo no encontrado
+    pthread_mutex_unlock(&tabla_mutex);
+    char *respuesta = "NOTFOUND: El archivo no existe en el sistema";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+    printf("Cliente solicitó archivo inexistente: %s\n", filename);
+}
+
+void add_to_waiting_queue(entrada_tabla_archivo *file_entry, datos_cliente_t *client) {
+    nodo_espera_t *new_node = malloc(sizeof(nodo_espera_t));
+    if (!new_node) {
+        printf("Error: No se pudo asignar memoria para nodo de espera\n");
+        return;
+    }
+    
+    new_node->client_socket = client->client_socket;
+    new_node->client_port = ntohs(client->client_addr.sin_port);
+    new_node->next = NULL;
+    
+    // Agregar al final de la cola
+    if (file_entry->cola_espera == NULL) {
+        file_entry->cola_espera = new_node;
+    } else {
+        nodo_espera_t *current = file_entry->cola_espera;
+        while (current->next != NULL) {
+            current = current->next;
+        }
+        current->next = new_node;
+    }
+    
+    printf("Cliente agregado a cola de espera del archivo %s\n", file_entry->nombre_archivo);
+}
+
+void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client) {
+    // Crear nuevo socket para conectar al file server
+    int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (file_server_socket < 0) {
+        printf("Error creando socket para file server\n");
+        
+        // Desbloquear archivo y procesar siguiente en cola
+        pthread_mutex_lock(&tabla_mutex);
+        file_entry->lock = 0;
+        process_next_in_queue(file_entry);
+        pthread_mutex_unlock(&tabla_mutex);
+        
+        char *respuesta = "ERROR: No se pudo crear socket para file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    // Configurar dirección del file server
+    struct sockaddr_in file_server_addr;
+    memset(&file_server_addr, 0, sizeof(file_server_addr));
+    file_server_addr.sin_family = AF_INET;
+    file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
+    file_server_addr.sin_port = htons(file_entry->port);
+    
+    printf("Conectando a file server en IP: %s, Puerto: %d\n", 
+           inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
+    
+    // Conectar al file server
+    if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
+        printf("Error conectando al file server\n");
+        close(file_server_socket);
+        
+        // Desbloquear archivo y procesar siguiente en cola
+        pthread_mutex_lock(&tabla_mutex);
+        file_entry->lock = 0;
+        process_next_in_queue(file_entry);
+        pthread_mutex_unlock(&tabla_mutex);
+        
+        char *respuesta = "ERROR: No se pudo conectar al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    // Crear mensaje para solicitar el archivo al file server
+    char request_msg[MAX_MSG];
+    sprintf(request_msg, "SF %s", file_entry->nombre_archivo);
+    
+    printf("Solicitando archivo %s al file server\n", file_entry->nombre_archivo);
+    
+    // Enviar solicitud al file server
+    int bytes_sent = send(file_server_socket, request_msg, strlen(request_msg), 0);
+    if (bytes_sent < 0) {
+        printf("Error enviando solicitud al file server\n");
+        close(file_server_socket);
+        
+        // Desbloquear archivo y procesar siguiente en cola
+        pthread_mutex_lock(&tabla_mutex);
+        file_entry->lock = 0;
+        process_next_in_queue(file_entry);
+        pthread_mutex_unlock(&tabla_mutex);
+        
+        char *respuesta = "ERROR: No se pudo enviar solicitud al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    printf("Solicitud enviada al file server, esperando respuesta...\n");
+    
+    // Recibir respuesta del file server
+    char response[MAX_MSG];
+    int bytes_received = recv(file_server_socket, response, MAX_MSG - 1, 0);
+    
+    close(file_server_socket);
+    
+    if (bytes_received > 0) {
+        response[bytes_received] = '\0';
+        printf("Respuesta recibida del file server: %s\n", response);
+        
+        if (strncmp(response, "FILE_CONTENT", 12) == 0) {
+            // Extraer filename y contenido
+            char filename[256];
+            char *content_start = NULL;
+            
+            if (sscanf(response, "FILE_CONTENT %255s", filename) == 1) {
+                content_start = strstr(response, filename);
+                if (content_start) {
+                    content_start += strlen(filename) + 1; // +1 para el espacio
+                    
+                    // Enviar contenido directamente al cliente
+                    char response_to_client[MAX_MSG];
+                    snprintf(response_to_client, sizeof(response_to_client), 
+                            "FILE_CONTENT:%s:%s", filename, content_start);
+                    
+                    send(requesting_client->client_socket, response_to_client, strlen(response_to_client), 0);
+                    printf("Contenido del archivo %s enviado directamente al cliente\n", filename);
+                } else {
+                    printf("Error extrayendo contenido del archivo\n");
+                    char *respuesta = "ERROR: Formato de respuesta inválido";
+                    send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+                }
+            } else {
+                printf("Error extrayendo nombre del archivo\n");
+                char *respuesta = "ERROR: Formato de respuesta inválido";
+                send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+            }
+        } else if (strncmp(response, "FILE_NOT_FOUND", 14) == 0) {
+            printf("File server reporta archivo no encontrado\n");
+            char *respuesta = "ERROR: Archivo no encontrado en file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        } else {
+            printf("Respuesta no reconocida del file server: %s\n", response);
+            char *respuesta = "ERROR: Respuesta no reconocida del file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        }
+    } else {
+        printf("Error recibiendo respuesta del file server\n");
+        char *respuesta = "ERROR: No se recibió respuesta del file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+    }
+    
+    // Desbloquear archivo y procesar siguiente en cola
+    pthread_mutex_lock(&tabla_mutex);
+    file_entry->lock = 0;
+    process_next_in_queue(file_entry);
+    pthread_mutex_unlock(&tabla_mutex);
+}
+
+void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client) {
+    // Crear nuevo socket para conectar al file server
+    int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (file_server_socket < 0) {
+        printf("Error creando socket para file server\n");
+        char *respuesta = "ERROR: No se pudo crear socket para file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    // Configurar dirección del file server
+    struct sockaddr_in file_server_addr;
+    memset(&file_server_addr, 0, sizeof(file_server_addr));
+    file_server_addr.sin_family = AF_INET;
+    file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
+    file_server_addr.sin_port = htons(file_entry->port);
+    
+    printf("Conectando a file server para lectura en IP: %s, Puerto: %d\n", 
+           inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
+    
+    // Conectar al file server
+    if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
+        printf("Error conectando al file server\n");
+        close(file_server_socket);
+        char *respuesta = "ERROR: No se pudo conectar al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    // Crear mensaje para solicitar el archivo al file server
+    char request_msg[MAX_MSG];
+    sprintf(request_msg, "SF %s", file_entry->nombre_archivo);
+    
+    printf("Solicitando archivo %s para lectura al file server\n", file_entry->nombre_archivo);
+    
+    // Enviar solicitud al file server
+    int bytes_sent = send(file_server_socket, request_msg, strlen(request_msg), 0);
+    if (bytes_sent < 0) {
+        printf("Error enviando solicitud al file server\n");
+        close(file_server_socket);
+        char *respuesta = "ERROR: No se pudo enviar solicitud al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    printf("Solicitud de lectura enviada al file server, esperando respuesta...\n");
+    
+    // Recibir respuesta del file server
+    char response[MAX_MSG];
+    int bytes_received = recv(file_server_socket, response, MAX_MSG - 1, 0);
+    
+    close(file_server_socket);
+    
+    if (bytes_received > 0) {
+        response[bytes_received] = '\0';
+        printf("Respuesta recibida del file server: %s\n", response);
+        
+        if (strncmp(response, "FILE_CONTENT", 12) == 0) {
+            // Extraer filename y contenido
+            char filename[256];
+            char *content_start = NULL;
+            
+            if (sscanf(response, "FILE_CONTENT %255s", filename) == 1) {
+                content_start = strstr(response, filename);
+                if (content_start) {
+                    content_start += strlen(filename) + 1; // +1 para el espacio
+                    
+                    // Enviar contenido directamente al cliente
+                    char response_to_client[MAX_MSG];
+                    snprintf(response_to_client, sizeof(response_to_client), 
+                            "FILE_CONTENT:%s:%s", filename, content_start);
+                    
+                    send(requesting_client->client_socket, response_to_client, strlen(response_to_client), 0);
+                    printf("Contenido del archivo %s enviado directamente al cliente\n", filename);
+                } else {
+                    printf("Error extrayendo contenido del archivo\n");
+                    char *respuesta = "ERROR: Formato de respuesta inválido";
+                    send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+                }
+            } else {
+                printf("Error extrayendo nombre del archivo\n");
+                char *respuesta = "ERROR: Formato de respuesta inválido";
+                send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+            }
+        } else if (strncmp(response, "FILE_NOT_FOUND", 14) == 0) {
+            printf("File server reporta archivo no encontrado\n");
+            char *respuesta = "ERROR: Archivo no encontrado en file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        } else {
+            printf("Respuesta no reconocida del file server: %s\n", response);
+            char *respuesta = "ERROR: Respuesta no reconocida del file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        }
+    } else {
+        printf("Error recibiendo respuesta del file server\n");
+        char *respuesta = "ERROR: No se recibió respuesta del file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+    }
+    
+    // Lectura completada - no hay locks que manejar
+    printf("Lectura del archivo %s completada\n", file_entry->nombre_archivo);
+}
+
+
+
+void process_next_in_queue(entrada_tabla_archivo *file_entry) {
+    // Esta función debe ser llamada con el mutex ya bloqueado
+    if (file_entry->cola_espera != NULL && file_entry->lock == 0) {
+        // Hay clientes esperando y el archivo no está bloqueado
+        file_entry->lock = 1;
+        printf("Procesando siguiente cliente en cola para archivo %s\n", file_entry->nombre_archivo);
+        
+        // Obtener el próximo cliente en la cola y REMOVERLO de la cola
+        nodo_espera_t *next_client = file_entry->cola_espera;
+        file_entry->cola_espera = next_client->next; // Remover de la cola
+        
+        // Crear datos_cliente_t temporales para el cliente que espera
+        datos_cliente_t temp_client;
+        temp_client.client_socket = next_client->client_socket;
+        temp_client.client_addr.sin_port = htons(next_client->client_port);
+        
+        // Liberar el nodo de espera ya que ya no está en la cola
+        free(next_client);
+        
+        // Solicitar archivo
+        pthread_mutex_unlock(&tabla_mutex); // Desbloquear temporalmente
+        request_file_from_server(file_entry, &temp_client);
+        pthread_mutex_lock(&tabla_mutex); // Volver a bloquear
+    }
+}
+
+void register_file_server(uint32_t ip, int file_server_port) {
+    pthread_mutex_lock(&file_servers_mutex);
+    
+    // Verificar si ya existe
+    registered_file_server_t *current = file_servers;
+    while (current != NULL) {
+        if (current->ip == ip) {
+            current->file_server_port = file_server_port; // Actualizar puerto
+            pthread_mutex_unlock(&file_servers_mutex);
+            printf("File server actualizado para IP existente\n");
+            return;
+        }
+        current = current->next;
+    }
+    
+    // Agregar nuevo file server
+    registered_file_server_t *new_server = malloc(sizeof(registered_file_server_t));
+    if (new_server) {
+        new_server->ip = ip;
+        new_server->file_server_port = file_server_port;
+        new_server->next = file_servers;
+        file_servers = new_server;
+        printf("Nuevo file server registrado\n");
+    } else {
+        printf("Error: No se pudo asignar memoria para file server\n");
+    }
+    
+    pthread_mutex_unlock(&file_servers_mutex);
+}
+
+int find_file_server_port(uint32_t ip) {
+    pthread_mutex_lock(&file_servers_mutex);
+    
+    registered_file_server_t *current = file_servers;
+    while (current != NULL) {
+        if (current->ip == ip) {
+            int port = current->file_server_port;
+            pthread_mutex_unlock(&file_servers_mutex);
+            return port;
+        }
+        current = current->next;
+    }
+    
+    pthread_mutex_unlock(&file_servers_mutex);
+    return -1; // No encontrado
 }
 
