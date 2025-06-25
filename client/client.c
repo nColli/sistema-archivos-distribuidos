@@ -215,7 +215,6 @@ void *client_interface_thread(void *arg) {
                 printf("Opcion no implementada\n");
                 continue;
         }
-
         print_menu();
     }
 
@@ -315,6 +314,7 @@ void *file_server_listener(void *arg) {
         
         char fns_ip[16];
         inet_ntop(AF_INET, &fns_addr.sin_addr, fns_ip, sizeof(fns_ip));
+        printf("\n======= FILE SERVER =======\n");
         printf("FNS conectado desde %s:%d para solicitar archivo\n", 
                fns_ip, ntohs(fns_addr.sin_port));
         
@@ -372,6 +372,7 @@ void *handle_fns_request(void *arg) {
                 send(fns_socket, "FILE_NOT_FOUND", 14, 0);
                 printf("Archivo %s no encontrado\n", filename);
             }
+            printf("====================================\n");
         } else if (strncmp(buffer, "WF", 2) == 0) {
             // Write File - recibir contenido y escribir archivo
             char filename[256];
@@ -405,13 +406,16 @@ void *handle_fns_request(void *arg) {
                         send(fns_socket, "WRITE_ERROR", 11, 0);
                         printf("Error escribiendo archivo %s\n", filename);
                     }
+                    printf("====================================\n");
                 } else {
                     send(fns_socket, "WRITE_ERROR", 11, 0);
                     printf("Error: Formato inválido en comando WF\n");
+                    printf("====================================\n");
                 }
             } else {
                 send(fns_socket, "WRITE_ERROR", 11, 0);
                 printf("Error: Formato inválido en comando WF\n");
+                printf("====================================\n");
             }
         }
     }
@@ -613,6 +617,82 @@ void send_write_request(char *message) {
             }
         } else if (strncmp(respuesta, "WAIT:", 5) == 0) {
             printf("%s\n", respuesta + 6); // Skip "WAIT: "
+            
+            printf("Esperando en cola... manteniendo conexión abierta\n");
+            int wait_bytes = recv(client_state.client_socket, respuesta, MAX_MSG - 1, 0);
+            if (wait_bytes > 0) {
+                respuesta[wait_bytes] = '\0';
+                if (strncmp(respuesta, "WRITE_CONTENT:", 14) == 0) {
+                    char received_filename[256];
+                    char *content_start = NULL;
+                    
+                    char *first_colon = strchr(respuesta + 14, ':');
+                    if (first_colon) {
+                        *first_colon = '\0';
+                        strncpy(received_filename, respuesta + 14, sizeof(received_filename) - 1);
+                        received_filename[sizeof(received_filename) - 1] = '\0';
+                        *first_colon = ':';
+                        content_start = first_colon + 1;
+                        
+                        char temp_filename[300];
+                        sprintf(temp_filename, "%s.tmp", received_filename);
+                        
+                        FILE *temp_file = fopen(temp_filename, "w");
+                        if (temp_file) {
+                            fprintf(temp_file, "%s", content_start);
+                            fclose(temp_file);
+                            
+                            printf("Archivo disponible! Abriendo editor para %s...\n", received_filename);
+                            printf("Contenido actual:\n");
+                            printf("====================\n");
+                            printf("%s", content_start);
+                            printf("\n====================\n");
+                            
+                            char editor_command[400];
+                            sprintf(editor_command, "vi %s", temp_filename);
+                            int result = system(editor_command);
+                            
+                            if (result == 0) {
+                                FILE *modified_file = fopen(temp_filename, "r");
+                                if (modified_file) {
+                                    char modified_content[MAX_MSG];
+                                    size_t read_size = fread(modified_content, 1, MAX_MSG - 1, modified_file);
+                                    modified_content[read_size] = '\0';
+                                    fclose(modified_file);
+                                    
+                                    char write_back_command[MAX_MSG];
+                                    sprintf(write_back_command, "C WB %s %s", received_filename, modified_content);
+                                    
+                                    printf("Enviando contenido modificado...\n");
+                                    send(client_state.client_socket, write_back_command, strlen(write_back_command), 0);
+                                    
+                                    char confirm_response[MAX_MSG];
+                                    int confirm_bytes = recv(client_state.client_socket, confirm_response, MAX_MSG - 1, 0);
+                                    if (confirm_bytes > 0) {
+                                        confirm_response[confirm_bytes] = '\0';
+                                        printf("Respuesta del servidor: %s\n", confirm_response);
+                                    }
+                                    
+                                    unlink(temp_filename);
+                                } else {
+                                    printf("Error: No se pudo leer el archivo modificado\n");
+                                }
+                            } else {
+                                printf("Error: Editor cerrado sin guardar o con error\n");
+                                unlink(temp_filename);
+                            }
+                        } else {
+                            printf("Error: No se pudo crear archivo temporal\n");
+                        }
+                    } else {
+                        printf("Error: Formato de respuesta WRITE_CONTENT inválido\n");
+                    }
+                } else {
+                    printf("Respuesta inesperada mientras esperaba: %s\n", respuesta);
+                }
+            } else {
+                printf("Error: Conexión perdida mientras esperaba en cola\n");
+            }
         } else if (strncmp(respuesta, "NOTFOUND:", 9) == 0) {
             printf("%s\n", respuesta + 10); // Skip "NOTFOUND: "
         } else if (strncmp(respuesta, "ERROR:", 6) == 0) {

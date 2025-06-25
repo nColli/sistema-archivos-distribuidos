@@ -875,6 +875,8 @@ void handle_write_file(char *filename, datos_cliente_t *data) {
                 
                 char *respuesta = "WAIT: El archivo está siendo utilizado, esperando...";
                 send(data->client_socket, respuesta, strlen(respuesta), 0);
+                
+                printf("Cliente agregado a cola, conexión mantenida abierta\n");
                 return;
             }
         }
@@ -1137,9 +1139,9 @@ void process_next_in_queue(entrada_tabla_archivo *file_entry) {
         // Liberar el nodo de espera ya que ya no está en la cola
         free(next_client);
         
-        // Solicitar archivo
+        // Solicitar archivo para escritura (no para lectura)
         pthread_mutex_unlock(&tabla_mutex); // Desbloquear temporalmente
-        request_file_from_server(file_entry, &temp_client);
+        request_file_for_write(file_entry, &temp_client);
         pthread_mutex_lock(&tabla_mutex); // Volver a bloquear
     }
 }
