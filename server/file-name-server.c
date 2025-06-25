@@ -23,14 +23,16 @@ typedef struct {
     nodo_espera_t *cola_espera;
 } entrada_tabla_registro;
 
-typedef struct {
+typedef struct entrada_tabla_archivo {
     char *nombre_archivo;
+    char *contenido;
     int ip;
     int port;
     int lock;
     pthread_mutex_t page_mutex;
     nodo_espera_t *cola_espera;
     entrada_tabla_registro *tabla_registros;
+    struct entrada_tabla_archivo *next; // Linked list pointer
 } entrada_tabla_archivo;
 
 typedef struct {
@@ -40,11 +42,16 @@ typedef struct {
 
 //Variables globales
 int server_socket, port;
-entrada_tabla_archivo *tabla_archivos;
+entrada_tabla_archivo *tabla_archivos = NULL; // Head of the linked list
+pthread_mutex_t tabla_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void *handle_conexion(void *arg);
 void handle_file_server(char *buffer, datos_cliente_t *data);
 void handle_client(char *buffer, datos_cliente_t *data);
+int igual(char *str1, char *str2);
+void add_file(char *archivo_contenido, datos_cliente_t *data);
+int search_file(char *file_name);
+void add_file_to_table(char *file_name, char *contenido, datos_cliente_t *data);
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -166,30 +173,39 @@ void *handle_conexion(void *arg) {
     
     printf("Cliente terminando conexion\n");
     
-    // Cleanup
     close(client_socket);
     free(data);
     return NULL;
 }
 
 void handle_file_server(char *buffer, datos_cliente_t *data) {
-    printf("Procesando mensaje de File Server: %s", buffer);
-    char *comando = buffer + 1;
+    char *comando = buffer + 2; //estructura F comando
+
+    char accion[3];
+    strncpy(accion, comando, 2);
+    accion[2] = '\0';
+
+    char *archivo_contenido = comando + 3; //2 letras y 1 espacio
     
-    char *respuesta = "FS_ACK";
+    if (igual(accion, "AF")) {
+        printf("Archivo y contenido: %s\n", archivo_contenido);
+        add_file(archivo_contenido, data); //nombre.txt contenido
+    }
+
+    char *respuesta = "OK";
     send(data->client_socket, respuesta, strlen(respuesta), 0);
-    
-    printf("Respuesta enviada al File Server: %s\n", respuesta);
 }
 
 void handle_client(char *buffer, datos_cliente_t *data) {
     printf("Procesando mensaje de Cliente: %s", buffer);
-    char *comando = buffer + 1;
+    char *comando = buffer + 2; //estructura C comando
 
-    if (strncmp(comando, "SALIR", 5) == 0) {
+    if (strncmp(comando, "SALIR", 5) == 0) { //C SALIR
         char *respuesta = "DISCONNECT_ACK";
         send(data->client_socket, respuesta, strlen(respuesta), 0);
         printf("Cliente solicitó desconexión\n");
+        close(data->client_socket);
+        printf("Cliente desconectado\n");
         return;
     }
     
@@ -197,4 +213,118 @@ void handle_client(char *buffer, datos_cliente_t *data) {
     send(data->client_socket, respuesta, strlen(respuesta), 0);
     
     printf("Respuesta enviada al Cliente: %s\n", respuesta);
+}
+
+int igual(char *str1, char *str2) {
+    if (str1 == NULL && str2 == NULL) {
+        return 1;
+    }
+    if (str1 == NULL || str2 == NULL) {
+        return 0;
+    }
+    return strcmp(str1, str2) == 0;
+}
+
+int search_file(char *file_name) {
+    if (file_name == NULL || tabla_archivos == NULL) {
+        return -1;
+    }
+    
+    entrada_tabla_archivo *current = tabla_archivos;
+    while (current != NULL) {
+        if (current->nombre_archivo != NULL && 
+            igual(current->nombre_archivo, file_name)) {
+            return 1; // archivo encontrado
+        }
+        current = current->next;
+    }
+    
+    return -1; // archivo encontrado
+}
+
+void add_file(char *archivo_contenido, datos_cliente_t *data) {
+    char *space_pos = strchr(archivo_contenido, ' ');
+    if (space_pos == NULL) {
+        printf("Error: No se encontró espacio en archivo_contenido\n");
+        return;
+    }
+    
+    int filename_length = space_pos - archivo_contenido;
+
+    char *file_name = malloc(filename_length + 1);
+    if (file_name == NULL) {
+        printf("Error: No se pudo asignar memoria para file_name\n");
+        return;
+    }
+    
+    strncpy(file_name, archivo_contenido, filename_length);
+    file_name[filename_length] = '\0';
+    
+    char *contenido = space_pos + 1;
+    
+    printf("Archivo: %s\n", file_name);
+    printf("Contenido: %s\n", contenido);
+    
+    int archivo_encontrado = search_file(file_name);
+
+    if (archivo_encontrado == -1) {
+        printf("Agregando archivo a tabla\n");
+        add_file_to_table(file_name, contenido, data);
+    } else {
+        printf("Archivo repetido\n");
+    }
+
+    free(file_name);
+}
+
+void add_file_to_table(char *file_name, char *contenido, datos_cliente_t *data) {
+    entrada_tabla_archivo *nuevo = malloc(sizeof(entrada_tabla_archivo));
+    if (nuevo == NULL) {
+        printf("Error: No se pudo asignar memoria para nuevo archivo\n");
+        return;
+    }
+
+    nuevo->nombre_archivo = strdup(file_name);
+    if (nuevo->nombre_archivo == NULL) {
+        printf("Error: No se pudo asignar memoria para nombre_archivo\n");
+        free(nuevo);
+        return;
+    }
+
+    char client_ip[16];
+    inet_ntop(AF_INET, &data->client_addr.sin_addr, client_ip, sizeof(client_ip));
+    int client_port = ntohs(data->client_addr.sin_port);
+    
+    struct sockaddr_in local_addr;
+    socklen_t local_len = sizeof(local_addr);
+    int server_local_port = 0;
+    if (getsockname(data->client_socket, (struct sockaddr*)&local_addr, &local_len) == 0) {
+        server_local_port = ntohs(local_addr.sin_port);
+    }
+    
+    printf("DEBUG - IP del cliente: %s\n", client_ip);
+    printf("DEBUG - Puerto origen del cliente: %d\n", client_port);
+    printf("DEBUG - Puerto local del servidor: %d\n", server_local_port);
+
+    nuevo->ip = ntohl(data->client_addr.sin_addr.s_addr);
+    nuevo->port = client_port; 
+    nuevo->lock = 0;
+    pthread_mutex_init(&nuevo->page_mutex, NULL);
+    nuevo->cola_espera = NULL;
+    nuevo->tabla_registros = NULL;
+    nuevo->next = NULL;
+
+    pthread_mutex_lock(&tabla_mutex);
+    if (tabla_archivos == NULL) {
+        tabla_archivos = nuevo;
+    } else {
+        entrada_tabla_archivo *actual = tabla_archivos;
+        while (actual->next != NULL) {
+            actual = actual->next;
+        }
+        actual->next = nuevo;
+    }
+    pthread_mutex_unlock(&tabla_mutex);
+
+    printf("Archivo '%s' agregado a la tabla con IP: %s, Puerto: %d\n", file_name, client_ip, nuevo->port);
 }
