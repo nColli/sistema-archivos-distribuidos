@@ -1,6 +1,6 @@
 esto es una prueba!!!!!
-!hola mundo cruel
-desde servidor de archivos
+2:!hola mundo cruel!!!
+3:desde cliente prueba!!!
 hola desde el
 cliente
 prueba

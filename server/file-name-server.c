@@ -58,8 +58,10 @@ void handle_file_server(char *buffer, datos_cliente_t *data);
 void handle_client(char *buffer, datos_cliente_t *data);
 int igual(char *str1, char *str2);
 void add_file(char *archivo_contenido, datos_cliente_t *data);
+void add_file_with_port(char *filename, int file_server_port, datos_cliente_t *data);
 int search_file(char *file_name);
 void add_file_to_table(char *file_name, datos_cliente_t *data);
+void add_file_to_table_with_port(char *file_name, int file_server_port, datos_cliente_t *data);
 void print_file_table();
 void print_file_table_unlocked();
 void remove_file_from_table(char *filename, datos_cliente_t *data);
@@ -67,7 +69,9 @@ void send_file_list(datos_cliente_t *data);
 void handle_read_file(char *filename, datos_cliente_t *data);
 void handle_read_record(char *buffer, datos_cliente_t *data);
 void handle_write_file(char *filename, datos_cliente_t *data);
+void handle_write_record(char *buffer, datos_cliente_t *data);
 void handle_write_back(char *buffer, datos_cliente_t *data);
+void handle_write_record_back(char *buffer, datos_cliente_t *data);
 void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
 void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos_cliente_t *requesting_client);
 void request_record_from_server(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *requesting_client);
@@ -78,6 +82,12 @@ void add_to_waiting_queue_front(entrada_tabla_archivo *file_entry, datos_cliente
 void process_next_in_queue(entrada_tabla_archivo *file_entry);
 void register_file_server(uint32_t ip, int file_server_port);
 int find_file_server_port(uint32_t ip);
+void request_record_for_write(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *requesting_client);
+void send_modified_record_to_server(entrada_tabla_archivo *file_entry, int record_number, char *content);
+int is_record_locked(entrada_tabla_archivo *file_entry, int record_number);
+void add_record_to_table(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *client);
+void remove_record_from_table(entrada_tabla_archivo *file_entry, int record_number);
+void add_to_record_waiting_queue(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *client);
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -239,9 +249,17 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
     }
 
     if (igual(accion, "AF")) {
-        char *filename = comando + 3; // 2 letras y 1 espacio
-        printf("Registrando archivo: %s\n", filename);
-        add_file(filename, data); // solo nombre del archivo
+        char filename[256];
+        int file_server_port;
+        if (sscanf(comando, "AF %255s %d", filename, &file_server_port) == 2) {
+            printf("Registrando archivo: %s con puerto file server: %d\n", filename, file_server_port);
+            add_file_with_port(filename, file_server_port, data);
+        } else {
+            printf("Error: Formato inválido en comando AF\n");
+            char *respuesta = "ERROR: Formato de comando AF inválido";
+            send(data->client_socket, respuesta, strlen(respuesta), 0);
+            return;
+        }
     } else if (igual(accion, "RF")) {
         char *filename = comando + 3; // 2 letras y 1 espacio
         printf("Solicitando eliminar archivo: %s\n", filename);
@@ -281,6 +299,14 @@ void handle_client(char *buffer, datos_cliente_t *data) {
         char *filename = comando + 3; // 2 letras "WF" + 1 espacio
         printf("Cliente solicitó escribir archivo: %s\n", filename);
         handle_write_file(filename, data);
+        return;
+    } else if (strncmp(comando, "WRB", 3) == 0) { //C WRB filename record_number content
+        printf("Cliente enviando registro modificado\n");
+        handle_write_record_back(comando, data);
+        return;
+    } else if (strncmp(comando, "WR", 2) == 0) { //C WR filename record_number
+        printf("Cliente solicitó escribir registro\n");
+        handle_write_record(comando, data);
         return;
     } else if (strncmp(comando, "WB", 2) == 0) { //C WB filename content
         printf("Cliente enviando contenido modificado\n");
@@ -376,6 +402,74 @@ void add_file_to_table(char *file_name, datos_cliente_t *data) {
 
     nuevo->ip = ntohl(data->client_addr.sin_addr.s_addr);
     nuevo->port = file_server_port;  // Usar file server port, no client port
+    nuevo->lock = 0;
+    pthread_mutex_init(&nuevo->page_mutex, NULL);
+    nuevo->cola_espera = NULL;
+    nuevo->tabla_registros = NULL;
+    nuevo->next = NULL;
+
+    if (tabla_archivos == NULL) {
+        tabla_archivos = nuevo;
+    } else {
+        entrada_tabla_archivo *actual = tabla_archivos;
+        while (actual->next != NULL) {
+            actual = actual->next;
+        }
+        actual->next = nuevo;
+    }
+
+    printf("Archivo '%s' agregado a la tabla con IP: %s, Puerto File Server: %d\n", file_name, client_ip, nuevo->port);
+    
+    // Imprimir la tabla actualizada (mutex ya está bloqueado)
+    print_file_table_unlocked();
+}
+
+void add_file_with_port(char *filename, int file_server_port, datos_cliente_t *data) {
+    // Remover salto de línea si existe
+    char *newline = strchr(filename, '\n');
+    if (newline) {
+        *newline = '\0';
+    }
+    
+    printf("Archivo: %s con puerto: %d\n", filename, file_server_port);
+    
+    pthread_mutex_lock(&tabla_mutex);
+    
+    int archivo_encontrado = search_file(filename);
+
+    if (archivo_encontrado == -1) {
+        printf("Agregando archivo a tabla con puerto específico\n");
+        add_file_to_table_with_port(filename, file_server_port, data);
+        pthread_mutex_unlock(&tabla_mutex);
+    } else {
+        printf("Archivo repetido\n");
+        pthread_mutex_unlock(&tabla_mutex);
+    }
+}
+
+void add_file_to_table_with_port(char *file_name, int file_server_port, datos_cliente_t *data) {
+    entrada_tabla_archivo *nuevo = malloc(sizeof(entrada_tabla_archivo));
+    if (nuevo == NULL) {
+        printf("Error: No se pudo asignar memoria para nuevo archivo\n");
+        return;
+    }
+
+    nuevo->nombre_archivo = strdup(file_name);
+    if (nuevo->nombre_archivo == NULL) {
+        printf("Error: No se pudo asignar memoria para nombre_archivo\n");
+        free(nuevo);
+        return;
+    }
+
+    char client_ip[16];
+    inet_ntop(AF_INET, &data->client_addr.sin_addr, client_ip, sizeof(client_ip));
+    
+    printf("DEBUG - IP del cliente: %s\n", client_ip);
+    printf("DEBUG - Puerto file server recibido: %d\n", file_server_port);
+    printf("DEBUG - Puerto origen del cliente: %d\n", ntohs(data->client_addr.sin_port));
+
+    nuevo->ip = ntohl(data->client_addr.sin_addr.s_addr);
+    nuevo->port = file_server_port;  // Usar el puerto recibido directamente
     nuevo->lock = 0;
     pthread_mutex_init(&nuevo->page_mutex, NULL);
     nuevo->cola_espera = NULL;
@@ -936,6 +1030,99 @@ void handle_write_file(char *filename, datos_cliente_t *data) {
     printf("Cliente solicitó escribir archivo inexistente: %s\n", filename);
 }
 
+void handle_write_record(char *buffer, datos_cliente_t *data) {
+    char filename[256];
+    int record_number;
+    
+    // Remove trailing newline if present
+    char *newline = strchr(buffer, '\n');
+    if (newline) {
+        *newline = '\0';
+    }
+    
+    if (sscanf(buffer, "WR %255s %d", filename, &record_number) != 2) {
+        char *respuesta = "ERROR: Formato inválido en solicitud de escritura de registro";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        printf("Error: Formato inválido en comando WR\n");
+        return;
+    }
+    
+    if (record_number <= 0) {
+        char *respuesta = "ERROR: El número de registro debe ser mayor a 0";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        printf("Error: Número de registro inválido: %d\n", record_number);
+        return;
+    }
+    
+    pthread_mutex_lock(&tabla_mutex);
+    
+    // Buscar el archivo en la tabla
+    entrada_tabla_archivo *file_entry = tabla_archivos;
+    while (file_entry != NULL) {
+        if (file_entry->nombre_archivo != NULL && igual(file_entry->nombre_archivo, filename)) {
+            // Archivo encontrado
+            
+            if (file_entry->lock != 0) {
+                // Archivo está bloqueado para escritura completa - agregar a cola general
+                printf("Archivo %s está bloqueado, agregando cliente a cola general\n", filename);
+                add_to_waiting_queue(file_entry, data);
+                
+                pthread_mutex_unlock(&tabla_mutex);
+                
+                char *respuesta = "WAIT: El archivo está siendo utilizado completamente, esperando...";
+                send(data->client_socket, respuesta, strlen(respuesta), 0);
+                return;
+            }
+            
+            // Archivo no está bloqueado - proceder con lógica de registros
+            if (file_entry->tabla_registros == NULL) {
+                // No hay registros bloqueados - mantener archivo desbloqueado pero agregar registro
+                printf("No hay registros bloqueados, agregando registro %d a tabla\n", record_number);
+                add_record_to_table(file_entry, record_number, data);
+                
+                pthread_mutex_unlock(&tabla_mutex);
+                
+                // Solicitar registro específico para escritura
+                request_record_for_write(file_entry, record_number, data);
+                return;
+                
+            } else {
+                // Verificar si el registro específico está en conflicto
+                if (is_record_locked(file_entry, record_number)) {
+                    // Registro específico está bloqueado - agregar a cola del registro
+                    printf("Registro %d está bloqueado, agregando a cola del registro\n", record_number);
+                    add_to_record_waiting_queue(file_entry, record_number, data);
+                    
+                    pthread_mutex_unlock(&tabla_mutex);
+                    
+                    char respuesta[MAX_MSG];
+                    sprintf(respuesta, "WAIT: El registro %d está siendo utilizado, esperando...", record_number);
+                    send(data->client_socket, respuesta, strlen(respuesta), 0);
+                    return;
+                    
+                } else {
+                    // Registro no está en conflicto - agregarlo y proceder
+                    printf("Registro %d no está en conflicto, agregando a tabla\n", record_number);
+                    add_record_to_table(file_entry, record_number, data);
+                    
+                    pthread_mutex_unlock(&tabla_mutex);
+                    
+                    // Solicitar registro específico para escritura
+                    request_record_for_write(file_entry, record_number, data);
+                    return;
+                }
+            }
+        }
+        file_entry = file_entry->next;
+    }
+    
+    // Archivo no encontrado
+    pthread_mutex_unlock(&tabla_mutex);
+    char *respuesta = "NOTFOUND: El archivo no existe en el sistema";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+    printf("Cliente solicitó escribir registro de archivo inexistente: %s\n", filename);
+}
+
 void add_to_waiting_queue_front(entrada_tabla_archivo *file_entry, datos_cliente_t *client) {
     nodo_espera_t *new_node = malloc(sizeof(nodo_espera_t));
     if (!new_node) {
@@ -1198,6 +1385,113 @@ void handle_write_back(char *buffer, datos_cliente_t *data) {
     send(data->client_socket, respuesta, strlen(respuesta), 0);
 }
 
+void handle_write_record_back(char *buffer, datos_cliente_t *data) {
+    // Formato esperado: "WRB filename record_number content"
+    char filename[256];
+    int record_number;
+    char *content_start = NULL;
+    
+    // Parse: WRB filename record_number content
+    char *first_space = strstr(buffer, " ");
+    if (!first_space) {
+        char *respuesta = "ERROR: Formato inválido en write record back";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    first_space++; // Skip "WRB "
+    
+    char *second_space = strstr(first_space, " ");
+    if (!second_space) {
+        char *respuesta = "ERROR: Formato inválido en write record back";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    // Extract filename
+    int filename_len = second_space - first_space;
+    strncpy(filename, first_space, filename_len);
+    filename[filename_len] = '\0';
+    
+    // Parse record number and content
+    char *third_space = strstr(second_space + 1, " ");
+    if (!third_space) {
+        char *respuesta = "ERROR: Formato inválido en write record back";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    record_number = atoi(second_space + 1);
+    content_start = third_space + 1;
+    
+    if (record_number <= 0) {
+        char *respuesta = "ERROR: Número de registro inválido";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    printf("Recibido registro modificado para archivo: %s, registro: %d\n", filename, record_number);
+    
+    pthread_mutex_lock(&tabla_mutex);
+    
+    // Buscar el archivo en la tabla
+    entrada_tabla_archivo *file_entry = tabla_archivos;
+    while (file_entry != NULL) {
+        if (file_entry->nombre_archivo != NULL && igual(file_entry->nombre_archivo, filename)) {
+            // Archivo encontrado - enviar registro modificado al file server
+            pthread_mutex_unlock(&tabla_mutex);
+            
+            send_modified_record_to_server(file_entry, record_number, content_start);
+            
+            // Procesar siguiente cliente en cola del registro 
+            pthread_mutex_lock(&tabla_mutex);
+            
+            if (file_entry->tabla_registros != NULL && 
+                file_entry->tabla_registros->registro == record_number) {
+                
+                if (file_entry->tabla_registros->cola_espera != NULL) {
+                    // Hay clientes esperando - procesar el siguiente
+                    nodo_espera_t *next_client = file_entry->tabla_registros->cola_espera;
+                    file_entry->tabla_registros->cola_espera = next_client->next;
+                    
+                    // Crear datos_cliente_t temporales para el cliente que espera
+                    datos_cliente_t temp_client;
+                    temp_client.client_socket = next_client->client_socket;
+                    temp_client.client_addr.sin_port = htons(next_client->client_port);
+                    
+                    printf("Procesando siguiente cliente en cola para registro %d\n", record_number);
+                    
+                    // Liberar el nodo de espera
+                    free(next_client);
+                    
+                    // Mantener el registro bloqueado para el siguiente cliente
+                    file_entry->tabla_registros->lock = 1;
+                    
+                    pthread_mutex_unlock(&tabla_mutex);
+                    
+                    // Solicitar registro para escritura para el siguiente cliente
+                    request_record_for_write(file_entry, record_number, &temp_client);
+                    
+                    pthread_mutex_lock(&tabla_mutex);
+                } else {
+                    // No hay más clientes esperando - remover registro
+                    remove_record_from_table(file_entry, record_number);
+                }
+            }
+            
+            pthread_mutex_unlock(&tabla_mutex);
+            
+            char *respuesta = "WRITE_RECORD_COMPLETE: Registro guardado exitosamente";
+            send(data->client_socket, respuesta, strlen(respuesta), 0);
+            return;
+        }
+        file_entry = file_entry->next;
+    }
+    
+    pthread_mutex_unlock(&tabla_mutex);
+    char *respuesta = "ERROR: Archivo no encontrado para write record back";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+}
+
 void send_modified_content_to_server(entrada_tabla_archivo *file_entry, char *content) {
     // Crear nuevo socket para conectar al file server
     int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -1271,19 +1565,19 @@ void process_next_in_queue(entrada_tabla_archivo *file_entry) {
 void register_file_server(uint32_t ip, int file_server_port) {
     pthread_mutex_lock(&file_servers_mutex);
     
-    // Verificar si ya existe
+    // Verificar si ya existe (misma IP Y mismo puerto)
     registered_file_server_t *current = file_servers;
     while (current != NULL) {
-        if (current->ip == ip) {
-            current->file_server_port = file_server_port; // Actualizar puerto
+        if (current->ip == ip && current->file_server_port == file_server_port) {
+            // Ya existe exactamente el mismo servidor
             pthread_mutex_unlock(&file_servers_mutex);
-            printf("File server actualizado para IP existente\n");
+            printf("File server ya registrado para IP y puerto existentes\n");
             return;
         }
         current = current->next;
     }
     
-    // Agregar nuevo file server
+    // Agregar nuevo file server (permite múltiples puertos por IP)
     registered_file_server_t *new_server = malloc(sizeof(registered_file_server_t));
     if (new_server) {
         new_server->ip = ip;
@@ -1313,5 +1607,215 @@ int find_file_server_port(uint32_t ip) {
     
     pthread_mutex_unlock(&file_servers_mutex);
     return -1; // No encontrado
+}
+
+int is_record_locked(entrada_tabla_archivo *file_entry, int record_number) {
+    if (file_entry->tabla_registros == NULL) {
+        return 0; // No hay registros bloqueados
+    }
+    
+    // Verificar si el registro específico está bloqueado
+    if (file_entry->tabla_registros->registro == record_number) {
+        return 1; // Registro específico está bloqueado
+    }
+    
+    return 0; // Registro no está bloqueado
+}
+
+void add_record_to_table(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *client) {
+    // Crear nuevo registro en la tabla
+    // Por simplicidad, usaremos el primer slot disponible en la tabla_registros
+    if (file_entry->tabla_registros == NULL) {
+        file_entry->tabla_registros = malloc(sizeof(entrada_tabla_registro));
+        if (file_entry->tabla_registros == NULL) {
+            printf("Error: No se pudo asignar memoria para tabla de registros\n");
+            return;
+        }
+        file_entry->tabla_registros->registro = record_number;
+        file_entry->tabla_registros->lock = 1;
+        file_entry->tabla_registros->cola_espera = NULL;
+        printf("Registro %d agregado a tabla de registros\n", record_number);
+    }
+}
+
+void remove_record_from_table(entrada_tabla_archivo *file_entry, int record_number) {
+    if (file_entry->tabla_registros != NULL && file_entry->tabla_registros->registro == record_number) {
+        // Liberar la cola de espera del registro si existe
+        nodo_espera_t *current = file_entry->tabla_registros->cola_espera;
+        while (current != NULL) {
+            nodo_espera_t *next = current->next;
+            free(current);
+            current = next;
+        }
+        
+        free(file_entry->tabla_registros);
+        file_entry->tabla_registros = NULL;
+        printf("Registro %d removido de tabla de registros\n", record_number);
+    }
+}
+
+void add_to_record_waiting_queue(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *client) {
+    if (file_entry->tabla_registros != NULL && file_entry->tabla_registros->registro == record_number) {
+        nodo_espera_t *new_node = malloc(sizeof(nodo_espera_t));
+        if (!new_node) {
+            printf("Error: No se pudo asignar memoria para nodo de espera de registro\n");
+            return;
+        }
+        
+        new_node->client_socket = client->client_socket;
+        new_node->client_port = ntohs(client->client_addr.sin_port);
+        new_node->next = NULL;
+        
+        // Agregar al final de la cola del registro
+        if (file_entry->tabla_registros->cola_espera == NULL) {
+            file_entry->tabla_registros->cola_espera = new_node;
+        } else {
+            nodo_espera_t *current = file_entry->tabla_registros->cola_espera;
+            while (current->next != NULL) {
+                current = current->next;
+            }
+            current->next = new_node;
+        }
+        
+        printf("Cliente agregado a cola de espera del registro %d\n", record_number);
+    }
+}
+
+// Función removida - la lógica ahora está integrada en handle_write_record_back
+
+void request_record_for_write(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *requesting_client) {
+    int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (file_server_socket < 0) {
+        printf("Error creando socket para file server (record write)\n");
+        char *respuesta = "ERROR: No se pudo crear socket para file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    struct sockaddr_in file_server_addr;
+    memset(&file_server_addr, 0, sizeof(file_server_addr));
+    file_server_addr.sin_family = AF_INET;
+    file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
+    file_server_addr.sin_port = htons(file_entry->port);
+    
+    printf("Conectando a file server para escritura de registro en IP: %s, Puerto: %d\n", 
+           inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
+    
+    if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
+        printf("Error conectando al file server para record write\n");
+        close(file_server_socket);
+        char *respuesta = "ERROR: No se pudo conectar al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    char request_msg[MAX_MSG];
+    sprintf(request_msg, "SR %s %d", file_entry->nombre_archivo, record_number);
+    
+    printf("Solicitando registro %d del archivo %s para escritura al file server\n", record_number, file_entry->nombre_archivo);
+    
+    int bytes_sent = send(file_server_socket, request_msg, strlen(request_msg), 0);
+    if (bytes_sent < 0) {
+        printf("Error enviando solicitud al file server\n");
+        close(file_server_socket);
+        char *respuesta = "ERROR: No se pudo enviar solicitud al file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        return;
+    }
+    
+    printf("Solicitud de escritura de registro enviada al file server, esperando respuesta...\n");
+    
+    char response[MAX_MSG];
+    int bytes_received = recv(file_server_socket, response, MAX_MSG - 1, 0);
+    
+    close(file_server_socket);
+    
+    if (bytes_received > 0) {
+        response[bytes_received] = '\0';
+        printf("Respuesta recibida del file server: %s\n", response);
+        
+        if (strncmp(response, "RECORD_CONTENT", 14) == 0) {
+            // Convertir RECORD_CONTENT a WRITE_RECORD_CONTENT
+            char response_to_client[MAX_MSG];
+            
+            // Parse RECORD_CONTENT:filename:record_number:content
+            char *first_colon = strchr(response + 14, ':');
+            if (first_colon) {
+                char *second_colon = strchr(first_colon + 1, ':');
+                if (second_colon) {
+                    char *content_start = second_colon + 1;
+                    
+                    snprintf(response_to_client, sizeof(response_to_client), 
+                            "WRITE_RECORD_CONTENT:%s:%d:%s", file_entry->nombre_archivo, record_number, content_start);
+                    
+                    send(requesting_client->client_socket, response_to_client, strlen(response_to_client), 0);
+                    printf("Contenido del registro %d enviado al cliente para edición\n", record_number);
+                } else {
+                    printf("Error: Formato de respuesta RECORD_CONTENT inválido\n");
+                    char *respuesta = "ERROR: Formato de respuesta inválido";
+                    send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+                }
+            } else {
+                printf("Error: Formato de respuesta RECORD_CONTENT inválido\n");
+                char *respuesta = "ERROR: Formato de respuesta inválido";
+                send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+            }
+        } else if (strncmp(response, "RECORD_NOT_FOUND", 16) == 0) {
+            printf("File server reporta registro no encontrado\n");
+            char *respuesta = "ERROR: Registro no encontrado en el archivo";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        } else if (strncmp(response, "FILE_NOT_FOUND", 14) == 0) {
+            printf("File server reporta archivo no encontrado\n");
+            char *respuesta = "ERROR: Archivo no encontrado en file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        } else {
+            printf("Respuesta no reconocida del file server: %s\n", response);
+            char *respuesta = "ERROR: Respuesta no reconocida del file server";
+            send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+        }
+    } else {
+        printf("Error recibiendo respuesta del file server\n");
+        char *respuesta = "ERROR: No se recibió respuesta del file server";
+        send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
+    }
+}
+
+void send_modified_record_to_server(entrada_tabla_archivo *file_entry, int record_number, char *content) {
+    int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (file_server_socket < 0) {
+        printf("Error creando socket para file server (record write back)\n");
+        return;
+    }
+    
+    struct sockaddr_in file_server_addr;
+    memset(&file_server_addr, 0, sizeof(file_server_addr));
+    file_server_addr.sin_family = AF_INET;
+    file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
+    file_server_addr.sin_port = htons(file_entry->port);
+    
+    printf("Conectando a file server para guardar registro modificado\n");
+    
+    if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
+        printf("Error conectando al file server para record write back\n");
+        close(file_server_socket);
+        return;
+    }
+    
+    // Crear mensaje para escribir el registro al file server
+    // Formato: "WR filename record_number content"
+    char write_msg[MAX_MSG];
+    snprintf(write_msg, sizeof(write_msg), "WR %s %d %s", file_entry->nombre_archivo, record_number, content);
+    
+    printf("Enviando registro modificado al file server: %s, registro: %d\n", file_entry->nombre_archivo, record_number);
+    printf("DEBUG - Comando completo: %s\n", write_msg);
+    
+    int bytes_sent = send(file_server_socket, write_msg, strlen(write_msg), 0);
+    if (bytes_sent < 0) {
+        printf("Error enviando registro modificado al file server\n");
+    } else {
+        printf("Registro modificado enviado exitosamente al file server\n");
+    }
+    
+    close(file_server_socket);
 }
 

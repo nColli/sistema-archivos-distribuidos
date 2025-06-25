@@ -37,6 +37,7 @@ void list_files();
 void read_file();
 void read_record();
 void write_file();
+void write_record();
 void upload(char *filename);
 
 int main(int argc, char *argv[]) {
@@ -214,6 +215,9 @@ void *client_interface_thread(void *arg) {
                 break;
             case 7:
                 read_record();
+                break;
+            case 8:
+                write_record();
                 break;
             default:
                 printf("Opcion no implementada\n");
@@ -437,10 +441,21 @@ void *handle_fns_request(void *arg) {
                             line[len-1] = '\0';
                         }
                         
+                        // Clean content: remove record number prefix if it exists
+                        char *clean_content = line;
+                        char record_prefix[20];
+                        sprintf(record_prefix, "%d:", record_number);
+                        
+                        // Check if line starts with "record_number:"
+                        if (strncmp(line, record_prefix, strlen(record_prefix)) == 0) {
+                            clean_content = line + strlen(record_prefix);
+                            printf("Removiendo prefijo '%s' del contenido\n", record_prefix);
+                        }
+                        
                         char response[MAX_MSG];
-                        sprintf(response, "RECORD_CONTENT:%s:%d:%s", filename, record_number, line);
+                        sprintf(response, "RECORD_CONTENT:%s:%d:%s", filename, record_number, clean_content);
                         send(fns_socket, response, strlen(response), 0);
-                        printf("Enviado registro %d del archivo %s al FNS\n", record_number, filename);
+                        printf("Enviado registro %d del archivo %s al FNS (contenido limpio)\n", record_number, filename);
                         break;
                     }
                     current_line++;
@@ -500,6 +515,97 @@ void *handle_fns_request(void *arg) {
                 printf("Error: Formato inválido en comando WF\n");
                 printf("====================================\n");
             }
+        } else if (strncmp(buffer, "WR", 2) == 0) {
+            // Write Record - recibir contenido y escribir registro específico
+            char filename[256];
+            int record_number;
+            char *content_start = NULL;
+            
+            printf("DEBUG - Comando WR recibido: %s\n", buffer);
+            
+            // Parse manually: "WR filename record_number content"
+            // Start from position 3 to skip "WR "
+            if (strlen(buffer) > 3) {
+                char *first_space = strchr(buffer + 3, ' '); // Skip "WR "
+                if (first_space) {
+                    // Extract filename (from start of buffer + 3 to first_space)
+                    int filename_len = first_space - (buffer + 3);
+                    strncpy(filename, buffer + 3, filename_len);
+                    filename[filename_len] = '\0';
+                    
+                    // Parse record number (from first_space + 1 to next space)
+                    char *second_space = strchr(first_space + 1, ' ');
+                    if (second_space) {
+                        record_number = atoi(first_space + 1);
+                        content_start = second_space + 1;
+                        
+                        printf("DEBUG - Parsed: filename='%s', record_number=%d, content='%s'\n", 
+                               filename, record_number, content_start);
+                    
+                        char filepath[512];
+                        sprintf(filepath, "archivos/%s", filename);
+                        
+                        printf("Escribiendo registro %d del archivo: %s\n", record_number, filepath);
+                        printf("Contenido: %s\n", content_start);
+                        
+                        // Read all lines from file
+                        FILE *file = fopen(filepath, "r");
+                        char lines[100][MAX_MSG]; // Support up to 100 lines
+                        int line_count = 0;
+                        
+                        if (file) {
+                            while (fgets(lines[line_count], MAX_MSG, file) && line_count < 100) {
+                                // Remove newline if present
+                                size_t len = strlen(lines[line_count]);
+                                if (len > 0 && lines[line_count][len-1] == '\n') {
+                                    lines[line_count][len-1] = '\0';
+                                }
+                                line_count++;
+                            }
+                            fclose(file);
+                        }
+                        
+                        // Ensure we have enough lines (expand file if necessary)
+                        while (line_count < record_number) {
+                            strcpy(lines[line_count], "");
+                            line_count++;
+                        }
+                        
+                        // Update the specific record
+                        if (record_number > 0 && record_number <= line_count) {
+                            strcpy(lines[record_number - 1], content_start);
+                            
+                            // Write all lines back to file
+                            file = fopen(filepath, "w");
+                            if (file) {
+                                for (int i = 0; i < line_count; i++) {
+                                    fprintf(file, "%s\n", lines[i]);
+                                }
+                                fclose(file);
+                                
+                                send(fns_socket, "WRITE_RECORD_SUCCESS", 20, 0);
+                                printf("Registro %d del archivo %s escrito exitosamente\n", record_number, filename);
+                            } else {
+                                send(fns_socket, "WRITE_RECORD_ERROR", 18, 0);
+                                printf("Error escribiendo registro en archivo %s\n", filename);
+                            }
+                        } else {
+                            send(fns_socket, "WRITE_RECORD_ERROR", 18, 0);
+                            printf("Error: Número de registro inválido: %d\n", record_number);
+                        }
+                    } else {
+                        send(fns_socket, "WRITE_RECORD_ERROR", 18, 0);
+                        printf("Error: No se encontró segundo espacio en comando WR\n");
+                    }
+                } else {
+                    send(fns_socket, "WRITE_RECORD_ERROR", 18, 0);
+                    printf("Error: No se encontró primer espacio en comando WR\n");
+                }
+            } else {
+                send(fns_socket, "WRITE_RECORD_ERROR", 18, 0);
+                printf("Error: Comando WR demasiado corto\n");
+            }
+            printf("====================================\n");
         }
     }
     
@@ -529,9 +635,9 @@ void upload(char *filename) {
     if (file) {
         fclose(file);
         
-        // Enviar solo el nombre del archivo para registrarlo
+        // Enviar el nombre del archivo y el puerto del file server para registrarlo
         char command[MAX_MSG];
-        sprintf(command, "F AF %s", filename);
+        sprintf(command, "F AF %s %d", filename, client_state.file_server_port);
         send_client_request(command);
         
         printf("Archivo %s registrado exitosamente en FNS\n", filename);
@@ -650,6 +756,33 @@ void write_file() {
     send_write_request(command);
 }
 
+void write_record() {
+    char filename[256];
+    int record_number;
+    
+    printf("Ingrese el nombre del archivo: ");
+    scanf("%s", filename);
+    
+    printf("Ingrese el número de registro a escribir: ");
+    scanf("%d", &record_number);
+    
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+    
+    if (record_number <= 0) {
+        printf("Error: El número de registro debe ser mayor a 0\n");
+        print_menu();
+        return;
+    }
+    
+    strncpy(last_requested_file, filename, sizeof(last_requested_file) - 1);
+    last_requested_file[sizeof(last_requested_file) - 1] = '\0';
+    
+    char command[MAX_MSG];
+    sprintf(command, "C WR %s %d", filename, record_number);
+    send_write_request(command);
+}
+
 void send_write_request(char *message) {
     printf("Enviando solicitud de escritura: %s\n", message);
     send(client_state.client_socket, message, strlen(message), 0);
@@ -724,6 +857,80 @@ void send_write_request(char *message) {
             } else {
                 printf("Error: Formato de respuesta WRITE_CONTENT inválido\n");
             }
+        } else if (strncmp(respuesta, "WRITE_RECORD_CONTENT:", 21) == 0) {
+            char received_filename[256];
+            int record_number;
+            char *content_start = NULL;
+            
+            char *first_colon = strchr(respuesta + 21, ':');
+            if (first_colon) {
+                *first_colon = '\0';
+                strncpy(received_filename, respuesta + 21, sizeof(received_filename) - 1);
+                received_filename[sizeof(received_filename) - 1] = '\0';
+                *first_colon = ':';
+                
+                char *second_colon = strchr(first_colon + 1, ':');
+                if (second_colon) {
+                    record_number = atoi(first_colon + 1);
+                    content_start = second_colon + 1;
+                    
+                    char temp_filename[300];
+                    sprintf(temp_filename, "%s_record_%d.tmp", received_filename, record_number);
+                    
+                    FILE *temp_file = fopen(temp_filename, "w");
+                    if (temp_file) {
+                        fprintf(temp_file, "%s", content_start);
+                        fclose(temp_file);
+                        
+                        printf("Abriendo editor para registro %d del archivo %s...\n", record_number, received_filename);
+                        
+                        char editor_command[400];
+                        sprintf(editor_command, "vi %s", temp_filename);
+                        int result = system(editor_command);
+                        
+                        if (result == 0) {
+                            FILE *modified_file = fopen(temp_filename, "r");
+                            if (modified_file) {
+                                char modified_content[MAX_MSG];
+                                size_t read_size = fread(modified_content, 1, MAX_MSG - 1, modified_file);
+                                modified_content[read_size] = '\0';
+                                fclose(modified_file);
+                                
+                                size_t len = strlen(modified_content);
+                                if (len > 0 && modified_content[len-1] == '\n') {
+                                    modified_content[len-1] = '\0';
+                                }
+                                
+                                char write_back_command[MAX_MSG];
+                                sprintf(write_back_command, "C WRB %s %d %s", received_filename, record_number, modified_content);
+                                
+                                printf("Enviando registro modificado...\n");
+                                send(client_state.client_socket, write_back_command, strlen(write_back_command), 0);
+                                
+                                char confirm_response[MAX_MSG];
+                                int confirm_bytes = recv(client_state.client_socket, confirm_response, MAX_MSG - 1, 0);
+                                if (confirm_bytes > 0) {
+                                    confirm_response[confirm_bytes] = '\0';
+                                    printf("Respuesta del servidor: %s\n", confirm_response);
+                                }
+                                
+                                unlink(temp_filename);
+                            } else {
+                                printf("Error: No se pudo leer el archivo modificado\n");
+                            }
+                        } else {
+                            printf("Error: Editor cerrado sin guardar o con error\n");
+                            unlink(temp_filename);
+                        }
+                    } else {
+                        printf("Error: No se pudo crear archivo temporal\n");
+                    }
+                } else {
+                    printf("Error: Formato de respuesta WRITE_RECORD_CONTENT inválido (falta segundo :)\n");
+                }
+            } else {
+                printf("Error: Formato de respuesta WRITE_RECORD_CONTENT inválido (falta primer :)\n");
+            }
         } else if (strncmp(respuesta, "WAIT:", 5) == 0) {
             printf("%s\n", respuesta + 6); // Skip "WAIT: "
             
@@ -795,6 +1002,80 @@ void send_write_request(char *message) {
                         }
                     } else {
                         printf("Error: Formato de respuesta WRITE_CONTENT inválido\n");
+                    }
+                } else if (strncmp(respuesta, "WRITE_RECORD_CONTENT:", 21) == 0) {
+                    char received_filename[256];
+                    int record_number;
+                    char *content_start = NULL;
+                    
+                    char *first_colon = strchr(respuesta + 21, ':');
+                    if (first_colon) {
+                        *first_colon = '\0';
+                        strncpy(received_filename, respuesta + 21, sizeof(received_filename) - 1);
+                        received_filename[sizeof(received_filename) - 1] = '\0';
+                        *first_colon = ':';
+                        
+                        char *second_colon = strchr(first_colon + 1, ':');
+                        if (second_colon) {
+                            record_number = atoi(first_colon + 1);
+                            content_start = second_colon + 1;
+                            
+                            char temp_filename[300];
+                            sprintf(temp_filename, "%s_record_%d.tmp", received_filename, record_number);
+                            
+                            FILE *temp_file = fopen(temp_filename, "w");
+                            if (temp_file) {
+                                fprintf(temp_file, "%s", content_start);
+                                fclose(temp_file);
+                                
+                                printf("Registro disponible! Abriendo editor para registro %d del archivo %s...\n", record_number, received_filename);
+                                
+                                char editor_command[400];
+                                sprintf(editor_command, "vi %s", temp_filename);
+                                int result = system(editor_command);
+                                
+                                if (result == 0) {
+                                    FILE *modified_file = fopen(temp_filename, "r");
+                                    if (modified_file) {
+                                        char modified_content[MAX_MSG];
+                                        size_t read_size = fread(modified_content, 1, MAX_MSG - 1, modified_file);
+                                        modified_content[read_size] = '\0';
+                                        fclose(modified_file);
+                                        
+                                        size_t len = strlen(modified_content);
+                                        if (len > 0 && modified_content[len-1] == '\n') {
+                                            modified_content[len-1] = '\0';
+                                        }
+                                        
+                                        char write_back_command[MAX_MSG];
+                                        sprintf(write_back_command, "C WRB %s %d %s", received_filename, record_number, modified_content);
+                                        
+                                        printf("Enviando registro modificado...\n");
+                                        send(client_state.client_socket, write_back_command, strlen(write_back_command), 0);
+                                        
+                                        char confirm_response[MAX_MSG];
+                                        int confirm_bytes = recv(client_state.client_socket, confirm_response, MAX_MSG - 1, 0);
+                                        if (confirm_bytes > 0) {
+                                            confirm_response[confirm_bytes] = '\0';
+                                            printf("Respuesta del servidor: %s\n", confirm_response);
+                                        }
+                                        
+                                        unlink(temp_filename);
+                                    } else {
+                                        printf("Error: No se pudo leer el archivo modificado\n");
+                                    }
+                                } else {
+                                    printf("Error: Editor cerrado sin guardar o con error\n");
+                                    unlink(temp_filename);
+                                }
+                            } else {
+                                printf("Error: No se pudo crear archivo temporal\n");
+                            }
+                        } else {
+                            printf("Error: Formato de respuesta WRITE_RECORD_CONTENT inválido\n");
+                        }
+                    } else {
+                        printf("Error: Formato de respuesta WRITE_RECORD_CONTENT inválido\n");
                     }
                 } else {
                     printf("Respuesta inesperada mientras esperaba: %s\n", respuesta);

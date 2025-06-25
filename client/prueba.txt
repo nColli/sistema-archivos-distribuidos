@@ -1,5 +1,0 @@
-esto es una prueba
-hola mundo cruel
-desde servidor de archivos
-hola desde el
-cliente
