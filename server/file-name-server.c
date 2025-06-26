@@ -1008,10 +1008,10 @@ void handle_write_file(char *filename, datos_cliente_t *data) {
         if (current->nombre_archivo != NULL && igual(current->nombre_archivo, filename)) {
             // Archivo encontrado
             
-            if (current->lock == 0) {
-                // Archivo no está bloqueado - bloquear para escritura
+            if (current->lock == 0 && current->tabla_registros == NULL) {
+                // Archivo no está bloqueado Y no hay registros activos - bloquear para escritura
                 current->lock = 1;
-                printf("Archivo %s bloqueado para escritura\n", filename);
+                printf("Archivo %s bloqueado para escritura completa\n", filename);
                 
                 // Agregar cliente al FRENTE de la cola (TOP priority)
                 add_to_waiting_queue_front(current, data);
@@ -1023,13 +1023,17 @@ void handle_write_file(char *filename, datos_cliente_t *data) {
                 return;
                 
             } else {
-                // Archivo está bloqueado - agregar a cola de espera
-                printf("Archivo %s ya está bloqueado, agregando cliente a cola de espera\n", filename);
+                // Archivo está bloqueado O tiene registros activos - agregar a cola de espera
+                if (current->lock != 0) {
+                    printf("Archivo %s ya está bloqueado, agregando cliente a cola de espera\n", filename);
+                } else if (current->tabla_registros != NULL) {
+                    printf("Archivo %s tiene registros activos, no se puede escribir archivo completo. Agregando cliente a cola de espera\n", filename);
+                }
                 add_to_waiting_queue(current, data);
                 
                 pthread_mutex_unlock(&tabla_mutex);
                 
-                char *respuesta = "WAIT: El archivo está siendo utilizado, esperando...";
+                char *respuesta = "WAIT: El archivo está siendo utilizado o tiene registros activos, esperando...";
                 send(data->client_socket, respuesta, strlen(respuesta), 0);
                 
                 printf("Cliente agregado a cola, conexión mantenida abierta\n");
@@ -1488,6 +1492,12 @@ void handle_write_record_back(char *buffer, datos_cliente_t *data) {
                 } else {
                     // No hay más clientes esperando - remover registro
                     remove_record_from_table(file_entry, record_number);
+                    
+                    // Si ya no hay registros activos, procesar cola de archivo completo
+                    if (file_entry->tabla_registros == NULL) {
+                        printf("No quedan registros activos, procesando cola de archivo completo\n");
+                        process_next_in_queue(file_entry);
+                    }
                 }
             }
             
@@ -1551,8 +1561,8 @@ void send_modified_content_to_server(entrada_tabla_archivo *file_entry, char *co
 
 void process_next_in_queue(entrada_tabla_archivo *file_entry) {
     // Esta función debe ser llamada con el mutex ya bloqueado
-    if (file_entry->cola_espera != NULL && file_entry->lock == 0) {
-        // Hay clientes esperando y el archivo no está bloqueado
+    if (file_entry->cola_espera != NULL && file_entry->lock == 0 && file_entry->tabla_registros == NULL) {
+        // Hay clientes esperando, el archivo no está bloqueado Y no hay registros activos
         file_entry->lock = 1;
         printf("Procesando siguiente cliente en cola para archivo %s\n", file_entry->nombre_archivo);
         
@@ -1572,6 +1582,13 @@ void process_next_in_queue(entrada_tabla_archivo *file_entry) {
         pthread_mutex_unlock(&tabla_mutex); // Desbloquear temporalmente
         request_file_for_write(file_entry, &temp_client);
         pthread_mutex_lock(&tabla_mutex); // Volver a bloquear
+    } else if (file_entry->cola_espera != NULL) {
+        // Hay clientes esperando pero no se puede procesar aún
+        if (file_entry->lock != 0) {
+            printf("Archivo %s sigue bloqueado, no se puede procesar siguiente en cola\n", file_entry->nombre_archivo);
+        } else if (file_entry->tabla_registros != NULL) {
+            printf("Archivo %s tiene registros activos, no se puede procesar escritura completa\n", file_entry->nombre_archivo);
+        }
     }
 }
 
