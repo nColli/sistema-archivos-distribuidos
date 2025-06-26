@@ -31,7 +31,7 @@ typedef struct entrada_tabla_archivo {
     pthread_mutex_t page_mutex;
     nodo_espera_t *cola_espera;
     entrada_tabla_registro *tabla_registros;
-    struct entrada_tabla_archivo *next; // Linked list pointer
+    struct entrada_tabla_archivo *next;
 } entrada_tabla_archivo;
 
 typedef struct {
@@ -40,16 +40,16 @@ typedef struct {
 } datos_cliente_t;
 
 // Estructura para mantener registro de file servers
-typedef struct registered_file_server {
+typedef struct file_server {
     uint32_t ip;
     int file_server_port;
-    struct registered_file_server *next;
-} registered_file_server_t;
+    struct file_server *next;
+} file_server_t;
 
 //Variables globales
 int server_socket, port;
-entrada_tabla_archivo *tabla_archivos = NULL; // Head of the linked list
-registered_file_server_t *file_servers = NULL; // Lista de file servers registrados
+entrada_tabla_archivo *tabla_archivos = NULL; //punta de lista enlazada
+file_server_t *file_servers = NULL; // Lista de file servers registrados
 pthread_mutex_t tabla_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t file_servers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -57,7 +57,6 @@ void *handle_conexion(void *arg);
 void handle_file_server(char *buffer, datos_cliente_t *data);
 void handle_client(char *buffer, datos_cliente_t *data);
 int igual(char *str1, char *str2);
-void add_file(char *archivo_contenido, datos_cliente_t *data);
 void add_file_with_port(char *filename, int file_server_port, datos_cliente_t *data);
 int search_file(char *file_name);
 void add_file_to_table(char *file_name, datos_cliente_t *data);
@@ -113,8 +112,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
+    struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
@@ -138,6 +136,9 @@ int main(int argc, char *argv[]) {
         struct sockaddr_in client_addr;
 
         int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
+
+        //solo pasa por aca despues de aceptar una nueva conexion, no es un bucle continuo, por eso se crea un hilo por bucle
+        //para que pueda crear conexion del cliente
 
         printf("\nNueva conexion\n");
 
@@ -168,9 +169,6 @@ int main(int argc, char *argv[]) {
 
         pthread_detach(threadId);
     }
-    
-    close(server_socket);
-    exit(0);
 }
 
 void *handle_conexion(void *arg) {
@@ -178,18 +176,16 @@ void *handle_conexion(void *arg) {
     int client_socket = data->client_socket;
     struct sockaddr_in client_addr = data->client_addr;
 
-    char buffer[MAX_MSG]; //al estar todo tamaño tiene que ser grande
+    char buffer[MAX_MSG];
     int flags = fcntl(client_socket, F_GETFL, 0);
     fcntl(client_socket, F_SETFL, flags & ~O_NONBLOCK);
 
     int bytes_recibidos = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
 
-    //se espera que cliente envie multiples mensajes, por lo que se mantiene la conexion abierta hasta que el cliente la cierra, cerrrando el el socket
+    //se espera que cliente envie multiples mensajes, por lo que se mantiene la conexion abierta en el hilo hasta que el cliente decide cerrarla, cerrrando el socket
     while (bytes_recibidos > 0) {
-        printf("Se recibieron %d bytes del cliente\n", bytes_recibidos);
-
+        //printf("Se recibieron %d bytes del cliente\n", bytes_recibidos);
         buffer[bytes_recibidos] = '\0';
-
         char tipo_cliente = buffer[0];
      
         if (tipo_cliente == 'F') {
@@ -204,7 +200,7 @@ void *handle_conexion(void *arg) {
         
         memset(buffer, 0, sizeof(buffer)); //limpio buffer para sig mensaje
         bytes_recibidos = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-        printf("Bytes recibidos %d\n", bytes_recibidos);
+        //printf("Bytes recibidos %d\n", bytes_recibidos);
     }
     
     printf("Cliente terminando conexion\n");
@@ -223,9 +219,9 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
 
     if (igual(accion, "RS")) {
         // Register Server - registrar este cliente como file server
-        printf("Registrando cliente como file server\n");
+        //printf("Registrando cliente como file server\n");
         
-        // Extraer el puerto del file server del mensaje
+        // Extraer el puerto del file server del mensaje - para el file server es un puerto distinto al cliente para evitar errores de lectura simultanea como caso solicitud archivo en mismo file server
         int file_server_port = 0;
         if (sscanf(comando, "RS %d", &file_server_port) != 1) {
             printf("Error: Formato inválido en registro de file server\n");
@@ -237,8 +233,7 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
         char client_ip[16];
         inet_ntop(AF_INET, &data->client_addr.sin_addr, client_ip, sizeof(client_ip));
         
-        printf("File Server registrado - IP: %s, Puerto File Server: %d, Puerto Cliente: %d\n", 
-               client_ip, file_server_port, ntohs(data->client_addr.sin_port));
+        printf("File Server registrado - IP: %s, Puerto File Server: %d, Puerto Cliente: %d\n", client_ip, file_server_port, ntohs(data->client_addr.sin_port));
         
         // Registrar el file server
         register_file_server(data->client_addr.sin_addr.s_addr, file_server_port);
@@ -246,9 +241,7 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
         char *respuesta = "REGISTERED_AS_FILE_SERVER";
         send(data->client_socket, respuesta, strlen(respuesta), 0);
         return;
-    }
-
-    if (igual(accion, "AF")) {
+    } else if (igual(accion, "AF")) {
         char filename[256];
         int file_server_port;
         if (sscanf(comando, "AF %255s %d", filename, &file_server_port) == 2) {
@@ -272,7 +265,8 @@ void handle_file_server(char *buffer, datos_cliente_t *data) {
 }
 
 void handle_client(char *buffer, datos_cliente_t *data) {
-    printf("Procesando mensaje de Cliente: %s\n", buffer);
+    print_file_table_unlocked();
+    printf("Procesando mensaje de Cliente: \n%s\n", buffer);
     char *comando = buffer + 2; //estructura C comando
 
     if (strncmp(comando, "SALIR", 5) == 0) { //C SALIR
@@ -299,14 +293,20 @@ void handle_client(char *buffer, datos_cliente_t *data) {
         char *filename = comando + 3; // 2 letras "WF" + 1 espacio
         printf("Cliente solicitó escribir archivo: %s\n", filename);
         handle_write_file(filename, data);
+        printf("\nTabla despues de solicitar escribir arhcivo\n");
+        print_file_table_unlocked();
         return;
     } else if (strncmp(comando, "WRB", 3) == 0) { //C WRB filename record_number content
         printf("Cliente enviando registro modificado\n");
         handle_write_record_back(comando, data);
+        printf("\nTabla despues de recibir registro modificado\n");
+        print_file_table_unlocked();
         return;
     } else if (strncmp(comando, "WR", 2) == 0) { //C WR filename record_number
         printf("Cliente solicitó escribir registro\n");
         handle_write_record(comando, data);
+        printf("\nTabla despues de solicitar escribir registro\n");
+        print_file_table_unlocked();
         return;
     } else if (strncmp(comando, "WB", 2) == 0) { //C WB filename content
         printf("Cliente enviando contenido modificado\n");
@@ -347,29 +347,6 @@ int search_file(char *file_name) {
     return -1; // archivo no encontrado
 }
 
-void add_file(char *filename, datos_cliente_t *data) {
-    // Remover salto de línea si existe
-    char *newline = strchr(filename, '\n');
-    if (newline) {
-        *newline = '\0';
-    }
-    
-    printf("Archivo: %s\n", filename);
-    
-    pthread_mutex_lock(&tabla_mutex);
-    
-    int archivo_encontrado = search_file(filename);
-
-    if (archivo_encontrado == -1) {
-        printf("Agregando archivo a tabla\n");
-        add_file_to_table(filename, data);
-        pthread_mutex_unlock(&tabla_mutex);
-    } else {
-        printf("Archivo repetido\n");
-        pthread_mutex_unlock(&tabla_mutex);
-    }
-}
-
 void add_file_to_table(char *file_name, datos_cliente_t *data) {
     entrada_tabla_archivo *nuevo = malloc(sizeof(entrada_tabla_archivo));
     if (nuevo == NULL) {
@@ -396,9 +373,9 @@ void add_file_to_table(char *file_name, datos_cliente_t *data) {
         return;
     }
     
-    printf("DEBUG - IP del cliente: %s\n", client_ip);
-    printf("DEBUG - Puerto file server: %d\n", file_server_port);
-    printf("DEBUG - Puerto origen del cliente: %d\n", ntohs(data->client_addr.sin_port));
+    //printf("DEBUG - IP del cliente: %s\n", client_ip);
+    //printf("DEBUG - Puerto file server: %d\n", file_server_port);
+    //printf("DEBUG - Puerto origen del cliente: %d\n", ntohs(data->client_addr.sin_port));
 
     nuevo->ip = ntohl(data->client_addr.sin_addr.s_addr);
     nuevo->port = file_server_port;  // Usar file server port, no client port
@@ -431,14 +408,14 @@ void add_file_with_port(char *filename, int file_server_port, datos_cliente_t *d
         *newline = '\0';
     }
     
-    printf("Archivo: %s con puerto: %d\n", filename, file_server_port);
+    //printf("Archivo: %s con puerto: %d\n", filename, file_server_port);
     
     pthread_mutex_lock(&tabla_mutex);
     
     int archivo_encontrado = search_file(filename);
 
     if (archivo_encontrado == -1) {
-        printf("Agregando archivo a tabla con puerto específico\n");
+        //printf("Agregando archivo a tabla con puerto específico\n");
         add_file_to_table_with_port(filename, file_server_port, data);
         pthread_mutex_unlock(&tabla_mutex);
     } else {
@@ -464,9 +441,9 @@ void add_file_to_table_with_port(char *file_name, int file_server_port, datos_cl
     char client_ip[16];
     inet_ntop(AF_INET, &data->client_addr.sin_addr, client_ip, sizeof(client_ip));
     
-    printf("DEBUG - IP del cliente: %s\n", client_ip);
-    printf("DEBUG - Puerto file server recibido: %d\n", file_server_port);
-    printf("DEBUG - Puerto origen del cliente: %d\n", ntohs(data->client_addr.sin_port));
+    //printf("DEBUG - IP del cliente: %s\n", client_ip);
+    //printf("DEBUG - Puerto file server recibido: %d\n", file_server_port);
+    //printf("DEBUG - Puerto origen del cliente: %d\n", ntohs(data->client_addr.sin_port));
 
     nuevo->ip = ntohl(data->client_addr.sin_addr.s_addr);
     nuevo->port = file_server_port;  // Usar el puerto recibido directamente
@@ -773,8 +750,7 @@ void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t
     file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
     file_server_addr.sin_port = htons(file_entry->port);
     
-    printf("Conectando a file server en IP: %s, Puerto: %d\n", 
-           inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
+    printf("Conectando a file server en IP: %s, Puerto: %d\n", inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
     
     // Conectar al file server
     if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
@@ -796,7 +772,7 @@ void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t
     char request_msg[MAX_MSG];
     sprintf(request_msg, "SF %s", file_entry->nombre_archivo);
     
-    printf("Solicitando archivo %s al file server\n", file_entry->nombre_archivo);
+    //printf("Solicitando archivo %s al file server\n", file_entry->nombre_archivo);
     
     // Enviar solicitud al file server
     int bytes_sent = send(file_server_socket, request_msg, strlen(request_msg), 0);
@@ -815,7 +791,7 @@ void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t
         return;
     }
     
-    printf("Solicitud enviada al file server, esperando respuesta...\n");
+    //printf("Solicitud enviada al file server, esperando respuesta...\n");
     
     // Recibir respuesta del file server
     char response[MAX_MSG];
@@ -825,7 +801,7 @@ void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t
     
     if (bytes_received > 0) {
         response[bytes_received] = '\0';
-        printf("Respuesta recibida del file server: %s\n", response);
+        //printf("Respuesta recibida del file server: %s\n", response);
         
         if (strncmp(response, "FILE_CONTENT", 12) == 0) {
             // Extraer filename y contenido
@@ -839,11 +815,10 @@ void request_file_from_server(entrada_tabla_archivo *file_entry, datos_cliente_t
                     
                     // Enviar contenido directamente al cliente
                     char response_to_client[MAX_MSG];
-                    snprintf(response_to_client, sizeof(response_to_client), 
-                            "FILE_CONTENT:%s:%s", filename, content_start);
+                    snprintf(response_to_client, sizeof(response_to_client), "FILE_CONTENT:%s:%s", filename, content_start);
                     
                     send(requesting_client->client_socket, response_to_client, strlen(response_to_client), 0);
-                    printf("Contenido del archivo %s enviado directamente al cliente\n", filename);
+                    //printf("Contenido del archivo %s enviado directamente al cliente\n", filename);
                 } else {
                     printf("Error extrayendo contenido del archivo\n");
                     char *respuesta = "ERROR: Formato de respuesta inválido";
@@ -893,8 +868,7 @@ void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos
     file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
     file_server_addr.sin_port = htons(file_entry->port);
     
-    printf("Conectando a file server para lectura en IP: %s, Puerto: %d\n", 
-           inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
+    printf("Conectando a file server para lectura en IP: %s, Puerto: %d\n", inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
     
     // Conectar al file server
     if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
@@ -909,7 +883,7 @@ void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos
     char request_msg[MAX_MSG];
     sprintf(request_msg, "SF %s", file_entry->nombre_archivo);
     
-    printf("Solicitando archivo %s para lectura al file server\n", file_entry->nombre_archivo);
+    //printf("Solicitando archivo %s para lectura al file server\n", file_entry->nombre_archivo);
     
     // Enviar solicitud al file server
     int bytes_sent = send(file_server_socket, request_msg, strlen(request_msg), 0);
@@ -933,7 +907,7 @@ void request_file_from_server_read_only(entrada_tabla_archivo *file_entry, datos
         response[bytes_received] = '\0';
         printf("Respuesta recibida del file server: %s\n", response);
         
-        if (strncmp(response, "FILE_CONTENT", 12) == 0) {
+        if (strncmp(response, "FILE_CONTENT", 12) == 0) { //primeros 12 caracterses es igual a FILE_CONTENT
             // Extraer filename y contenido
             char filename[256];
             char *content_start = NULL;
@@ -1357,7 +1331,7 @@ void request_file_for_write(entrada_tabla_archivo *file_entry, datos_cliente_t *
         send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
     }
     
-    // NO desbloqueamos aca - el archivo permanece bloqueado hasta que se complete la escritura
+    // NO desbloquo aca - el archivo permanece bloqueado hasta que se complete la escritura
 }
 
 void handle_write_back(char *buffer, datos_cliente_t *data) {
@@ -1369,7 +1343,7 @@ void handle_write_back(char *buffer, datos_cliente_t *data) {
         send(data->client_socket, respuesta, strlen(respuesta), 0);
         return;
     }
-    content_start++; // Skip the first space
+    content_start++;
     
     char *second_space = strstr(content_start, " ");
     if (!second_space) {
@@ -1377,13 +1351,11 @@ void handle_write_back(char *buffer, datos_cliente_t *data) {
         send(data->client_socket, respuesta, strlen(respuesta), 0);
         return;
     }
-    
-    // Extract filename
+
     int filename_len = second_space - content_start;
     strncpy(filename, content_start, filename_len);
     filename[filename_len] = '\0';
-    
-    // Get content after filename
+
     char *modified_content = second_space + 1;
     
     printf("Recibido contenido modificado para archivo: %s\n", filename);
@@ -1409,6 +1381,7 @@ void handle_write_back(char *buffer, datos_cliente_t *data) {
                 file_entry->cola_espera = completed_client->next;
                 free(completed_client);
                 printf("Cliente removido de la cola después de completar escritura\n");
+                print_file_table_unlocked(); //sin bloquear
             }
             
             // Procesar siguiente cliente en cola
@@ -1433,14 +1406,14 @@ void handle_write_record_back(char *buffer, datos_cliente_t *data) {
     int record_number;
     char *content_start = NULL;
     
-    // Parse: WRB filename record_number content
+    // Parsear: WRB filename record_number content
     char *first_space = strstr(buffer, " ");
     if (!first_space) {
         char *respuesta = "ERROR: Formato inválido en write record back";
         send(data->client_socket, respuesta, strlen(respuesta), 0);
         return;
     }
-    first_space++; // Skip "WRB "
+    first_space++;
     
     char *second_space = strstr(first_space, " ");
     if (!second_space) {
@@ -1448,13 +1421,11 @@ void handle_write_record_back(char *buffer, datos_cliente_t *data) {
         send(data->client_socket, respuesta, strlen(respuesta), 0);
         return;
     }
-    
-    // Extract filename
+
     int filename_len = second_space - first_space;
     strncpy(filename, first_space, filename_len);
     filename[filename_len] = '\0';
-    
-    // Parse record number and content
+
     char *third_space = strstr(second_space + 1, " ");
     if (!third_space) {
         char *respuesta = "ERROR: Formato inválido en write record back";
@@ -1535,7 +1506,7 @@ void handle_write_record_back(char *buffer, datos_cliente_t *data) {
 }
 
 void send_modified_content_to_server(entrada_tabla_archivo *file_entry, char *content) {
-    // Crear nuevo socket para conectar al file server
+    // Crear nuevo socket para conectar al file server - porque no se mantiene conexion abierta constantemente
     int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (file_server_socket < 0) {
         printf("Error creando socket para file server (write back)\n");
@@ -1608,7 +1579,7 @@ void register_file_server(uint32_t ip, int file_server_port) {
     pthread_mutex_lock(&file_servers_mutex);
     
     // Verificar si ya existe (misma IP Y mismo puerto)
-    registered_file_server_t *current = file_servers;
+    file_server_t *current = file_servers;
     while (current != NULL) {
         if (current->ip == ip && current->file_server_port == file_server_port) {
             // Ya existe exactamente el mismo servidor
@@ -1620,7 +1591,7 @@ void register_file_server(uint32_t ip, int file_server_port) {
     }
     
     // Agregar nuevo file server (permite múltiples puertos por IP)
-    registered_file_server_t *new_server = malloc(sizeof(registered_file_server_t));
+    file_server_t *new_server = malloc(sizeof(file_server_t));
     if (new_server) {
         new_server->ip = ip;
         new_server->file_server_port = file_server_port;
@@ -1637,7 +1608,7 @@ void register_file_server(uint32_t ip, int file_server_port) {
 int find_file_server_port(uint32_t ip) {
     pthread_mutex_lock(&file_servers_mutex);
     
-    registered_file_server_t *current = file_servers;
+    file_server_t *current = file_servers;
     while (current != NULL) {
         if (current->ip == ip) {
             int port = current->file_server_port;
@@ -1723,7 +1694,6 @@ void add_to_record_waiting_queue(entrada_tabla_archivo *file_entry, int record_n
     }
 }
 
-// Función removida - la lógica ahora está integrada en handle_write_record_back
 
 void request_record_for_write(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *requesting_client) {
     int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -1740,8 +1710,7 @@ void request_record_for_write(entrada_tabla_archivo *file_entry, int record_numb
     file_server_addr.sin_addr.s_addr = htonl(file_entry->ip);
     file_server_addr.sin_port = htons(file_entry->port);
     
-    printf("Conectando a file server para escritura de registro en IP: %s, Puerto: %d\n", 
-           inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
+    printf("Conectando a file server para escritura de registro en IP: %s, Puerto: %d\n", inet_ntoa((struct in_addr){htonl(file_entry->ip)}), file_entry->port);
     
     if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
         printf("Error conectando al file server para record write\n");

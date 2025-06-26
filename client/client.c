@@ -9,16 +9,15 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <time.h>
 #define MAX_MSG 1024
 
 typedef struct {
-    int client_socket;  // Socket for client requests
-    int server_socket;  // Socket for file server functionality
+    int client_socket;
+    int server_socket;
     char* server_ip;
     int server_port;
-    int client_port;        // Port for client connections
-    int file_server_port;   // Port where this client acts as file server
+    int client_port;
+    int file_server_port;
 } client_state_t;
 
 client_state_t client_state = {0};
@@ -62,7 +61,7 @@ int main(int argc, char *argv[]) {
     printf("FNS Address: %s:%d\n", client_state.server_ip, client_state.server_port);
     printf("========================================\n\n");
 
-    // 1. Setup file server socket (for listening to FNS requests)
+    // Configuracion file server socket - para escuchar peticiones del FNS
     client_state.server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (client_state.server_socket < 0) {
         printf("Error al crear socket file server\n");
@@ -96,7 +95,7 @@ int main(int argc, char *argv[]) {
 
     printf("File server escuchando en puerto %d\n", client_state.file_server_port);
 
-    // 2. Start file server listener thread
+    // Iniciar hilo que escucha request para el file server
     pthread_t file_server_thread;
     if (pthread_create(&file_server_thread, NULL, file_server_listener, NULL) != 0) {
         printf("Error al crear hilo file server\n");
@@ -104,7 +103,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    // 3. Start client interface thread
+    // hilo para la interfaz del cliente
     pthread_t client_thread;
     if (pthread_create(&client_thread, NULL, client_interface_thread, NULL) != 0) {
         printf("Error al crear hilo cliente\n");
@@ -115,15 +114,12 @@ int main(int argc, char *argv[]) {
 
     printf("Sistema iniciado. File server y cliente funcionando...\n\n");
 
-    // Wait for client thread to finish (when user exits)
+    // cuando se cierra el menu
     pthread_join(client_thread, NULL);
-    
-    // Cleanup
     printf("Cerrando sistema...\n");
     pthread_cancel(file_server_thread);
     close(client_state.client_socket);
     close(client_state.server_socket);
-    
     return 0;
 }
 
@@ -131,14 +127,14 @@ void *client_interface_thread(void *arg) {
     char opcion[10];
     char mensaje[MAX_MSG];
     
-    // Setup client socket (for sending requests to FNS)
+    // Setup client socket - enviar request a FNS
     client_state.client_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (client_state.client_socket < 0) {
         printf("Error al crear socket cliente\n");
         pthread_exit(NULL);
     }
 
-    // Bind to specified client port
+    // Bind a puerto especifico del cliente
     int opt = 1;
     if (setsockopt(client_state.client_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt cliente fallo");
@@ -158,7 +154,7 @@ void *client_interface_thread(void *arg) {
         pthread_exit(NULL);
     }
 
-    // Connect to FNS
+    // conectarse al fns
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -176,25 +172,23 @@ void *client_interface_thread(void *arg) {
         pthread_exit(NULL);
     }
 
-    printf("Cliente conectado al FNS en %s:%d desde puerto %d\n", 
-           client_state.server_ip, client_state.server_port, client_state.client_port);
+    printf("Cliente conectado al FNS en %s:%d desde puerto %d\n", client_state.server_ip, client_state.server_port, client_state.client_port);
 
-    // Register as file server with FNS
+    // registrarse como file server en fns
     sprintf(mensaje, "F RS %d", client_state.file_server_port);
     send_client_request(mensaje);
 
-    print_menu();
-
-    while (1) {
+    int running = 1;
+    while (running) {
+        print_menu();
         printf("Opcion: ");
         fgets(opcion, sizeof(opcion), stdin);
         opcion[strcspn(opcion, "\n")] = 0;
 
-        if (strcmp(opcion, "0") == 0) {
-            break;
-        }
-
         switch(atoi(opcion)) {
+            case 0:
+                running = 0;
+                break;
             case 1:
                 upload_all_files();
                 break;
@@ -223,7 +217,6 @@ void *client_interface_thread(void *arg) {
                 printf("Opcion no implementada\n");
                 continue;
         }
-        print_menu();
     }
 
     close(client_state.client_socket);
@@ -234,39 +227,38 @@ void send_client_request(char *message) {
     printf("Enviando mensaje: %s\n", message);
     send(client_state.client_socket, message, strlen(message), 0);
     
-    // Receive response
+    // espero a recibir respuesta de la accion solicitada
     char respuesta[MAX_MSG];
     int bytes = recv(client_state.client_socket, respuesta, MAX_MSG - 1, 0);
     if (bytes > 0) {
         respuesta[bytes] = '\0';
         
-        // Process the response
+        // procesar la respuesta - comparar con comandos conocidos que puede enviar fns
         if (strncmp(respuesta, "FILE_CONTENT:", 13) == 0) {
-            // Parse FILE_CONTENT:filename:content
+            // Parsear FILE_CONTENT:filename:content
             char received_filename[256];
             char *content_start = NULL;
             
-            // Find the second colon to separate filename from content
+            // encontrar segunda : para separar
             char *first_colon = strchr(respuesta + 13, ':');
             if (first_colon) {
-                *first_colon = '\0';  // Temporarily null-terminate filename
+                *first_colon = '\0';
                 strncpy(received_filename, respuesta + 13, sizeof(received_filename) - 1);
                 received_filename[sizeof(received_filename) - 1] = '\0';
-                *first_colon = ':';  // Restore the colon
+                *first_colon = ':';
                 content_start = first_colon + 1;
                 
-                // Save file to client directory
+                // guardar archivo en mismo directorio que ejecutable (se descarga)
                 FILE *file = fopen(received_filename, "w");
                 if (file) {
                     fprintf(file, "%s", content_start);
                     fclose(file);
                     printf("Archivo %s guardado exitosamente\n", received_filename);
-                    
-                    // Display the content
+
                     printf("\n=== CONTENIDO DEL ARCHIVO: %s ===\n", received_filename);
                     printf("%s", content_start);
                     if (content_start[strlen(content_start) - 1] != '\n') {
-                        printf("\n");  // Add newline if content doesn't end with one
+                        printf("\n");
                     }
                     printf("================================\n");
                 } else {
@@ -307,7 +299,7 @@ void send_client_request(char *message) {
         } else if (strncmp(respuesta, "FILE_READY:", 11) == 0) {
             printf("Archivo descargado exitosamente\n");
             
-            // Print the content of the downloaded file
+            // mostrar archivo descargado
             if (strlen(last_requested_file) > 0) {
                 FILE *file = fopen(last_requested_file, "r");
                 if (file) {
@@ -323,11 +315,11 @@ void send_client_request(char *message) {
                 }
             }
         } else if (strncmp(respuesta, "WAIT:", 5) == 0) {
-            printf("%s\n", respuesta + 6); // Skip "WAIT: "
+            printf("%s\n", respuesta + 6); // saltearse "WAIT: "
         } else if (strncmp(respuesta, "NOTFOUND:", 9) == 0) {
-            printf("%s\n", respuesta + 10); // Skip "NOTFOUND: "
+            printf("%s\n", respuesta + 10); // saltearse "NOTFOUND: "
         } else if (strncmp(respuesta, "ERROR:", 6) == 0) {
-            printf("%s\n", respuesta + 7); // Skip "ERROR: "
+            printf("%s\n", respuesta + 7); // saltearse "ERROR: "
         } else if (strncmp(respuesta, "ARCHIVO_ELIMINADO", 17) == 0) {
             printf("Archivo eliminado exitosamente del sistema\n");
         } else if (strncmp(respuesta, "\nLISTA ARCHIVOS:", 16) == 0) {
@@ -352,10 +344,10 @@ void *file_server_listener(void *arg) {
         char fns_ip[16];
         inet_ntop(AF_INET, &fns_addr.sin_addr, fns_ip, sizeof(fns_ip));
         printf("\n======= FILE SERVER =======\n");
-        printf("FNS conectado desde %s:%d para solicitar archivo\n", 
-               fns_ip, ntohs(fns_addr.sin_port));
+        printf("FNS conectado desde %s:%d para solicitar archivo\n", fns_ip, ntohs(fns_addr.sin_port));
         
-        // Create thread to handle FNS request
+        // crear hilo para manejar las peticiones del FNS - no se mantiene viva la conexion una vez
+        //que se recibe un mensaje se cierra el socket y server lo vuelve a abrir cuando necesita un archivo o escribir un archivo
         pthread_t request_thread;
         int *socket_ptr = malloc(sizeof(int));
         *socket_ptr = fns_socket;
@@ -369,7 +361,6 @@ void *file_server_listener(void *arg) {
         
         pthread_detach(request_thread);
     }
-    return NULL;
 }
 
 void *handle_fns_request(void *arg) {
@@ -409,7 +400,6 @@ void *handle_fns_request(void *arg) {
                 send(fns_socket, "FILE_NOT_FOUND", 14, 0);
                 printf("Archivo %s no encontrado\n", filename);
             }
-            printf("====================================\n");
         } else if (strncmp(buffer, "SR", 2) == 0) {
             char filename[256];
             int record_number;
@@ -417,7 +407,6 @@ void *handle_fns_request(void *arg) {
             if (sscanf(buffer, "SR %255s %d", filename, &record_number) != 2) {
                 send(fns_socket, "RECORD_ERROR", 12, 0);
                 printf("Error: Formato inválido en comando SR\n");
-                printf("====================================\n");
                 return NULL;
             }
             
@@ -431,8 +420,14 @@ void *handle_fns_request(void *arg) {
                 char line[MAX_MSG];
                 int current_line = 1;
                 int found = 0;
-                
+
+                printf("Archivo existe datos:\n");
+                printf("fuera del while Current line %d\n record_number %d\n", current_line, record_number);
+
+                usleep(10000);
+
                 while (fgets(line, sizeof(line), file) && current_line <= record_number) {
+                    printf("Current line %d\n record_number %d\n", current_line, record_number);
                     if (current_line == record_number) {
                         found = 1;
                         
@@ -440,22 +435,19 @@ void *handle_fns_request(void *arg) {
                         if (len > 0 && line[len-1] == '\n') {
                             line[len-1] = '\0';
                         }
-                        
-                        // Clean content: remove record number prefix if it exists
+
                         char *clean_content = line;
                         char record_prefix[20];
                         sprintf(record_prefix, "%d:", record_number);
-                        
-                        // Check if line starts with "record_number:"
+
                         if (strncmp(line, record_prefix, strlen(record_prefix)) == 0) {
                             clean_content = line + strlen(record_prefix);
-                            printf("Removiendo prefijo '%s' del contenido\n", record_prefix);
                         }
                         
                         char response[MAX_MSG];
                         sprintf(response, "RECORD_CONTENT:%s:%d:%s", filename, record_number, clean_content);
                         send(fns_socket, response, strlen(response), 0);
-                        printf("Enviado registro %d del archivo %s al FNS (contenido limpio)\n", record_number, filename);
+                        printf("Enviado registro %d del archivo %s al FNS\n", record_number, filename);
                         break;
                     }
                     current_line++;
@@ -470,21 +462,18 @@ void *handle_fns_request(void *arg) {
                 send(fns_socket, "FILE_NOT_FOUND", 14, 0);
                 printf("Archivo %s no encontrado\n", filename);
             }
-            printf("====================================\n");
         } else if (strncmp(buffer, "WF", 2) == 0) {
             // Write File - recibir contenido y escribir archivo
             char filename[256];
             char *content_start = strstr(buffer, " ");
             if (content_start) {
-                content_start++; // Skip first space
+                content_start++;
                 char *second_space = strstr(content_start, " ");
                 if (second_space) {
-                    // Extract filename
                     int filename_len = second_space - content_start;
                     strncpy(filename, content_start, filename_len);
                     filename[filename_len] = '\0';
-                    
-                    // Get content
+
                     char *file_content = second_space + 1;
                     
                     // Construir la ruta completa del archivo en el directorio archivos
@@ -499,21 +488,18 @@ void *handle_fns_request(void *arg) {
                         fclose(file);
                         
                         send(fns_socket, "WRITE_SUCCESS", 13, 0);
-                        printf("Archivo %s escrito exitosamente\n", filename);
+                        //printf("Archivo %s escrito exitosamente\n", filename);
                     } else {
                         send(fns_socket, "WRITE_ERROR", 11, 0);
                         printf("Error escribiendo archivo %s\n", filename);
                     }
-                    printf("====================================\n");
                 } else {
                     send(fns_socket, "WRITE_ERROR", 11, 0);
                     printf("Error: Formato inválido en comando WF\n");
-                    printf("====================================\n");
                 }
             } else {
                 send(fns_socket, "WRITE_ERROR", 11, 0);
                 printf("Error: Formato inválido en comando WF\n");
-                printf("====================================\n");
             }
         } else if (strncmp(buffer, "WR", 2) == 0) {
             // Write Record - recibir contenido y escribir registro específico
@@ -523,24 +509,20 @@ void *handle_fns_request(void *arg) {
             
             printf("DEBUG - Comando WR recibido: %s\n", buffer);
             
-            // Parse manually: "WR filename record_number content"
-            // Start from position 3 to skip "WR "
+            // "WR filename record_number content"
             if (strlen(buffer) > 3) {
-                char *first_space = strchr(buffer + 3, ' '); // Skip "WR "
+                char *first_space = strchr(buffer + 3, ' '); // saltar "WR "
                 if (first_space) {
-                    // Extract filename (from start of buffer + 3 to first_space)
                     int filename_len = first_space - (buffer + 3);
                     strncpy(filename, buffer + 3, filename_len);
                     filename[filename_len] = '\0';
-                    
-                    // Parse record number (from first_space + 1 to next space)
+
                     char *second_space = strchr(first_space + 1, ' ');
                     if (second_space) {
                         record_number = atoi(first_space + 1);
                         content_start = second_space + 1;
                         
-                        printf("DEBUG - Parsed: filename='%s', record_number=%d, content='%s'\n", 
-                               filename, record_number, content_start);
+                        //printf("DEBUG - Parsed: filename='%s', record_number=%d, content='%s'\n", filename, record_number, content_start);
                     
                         char filepath[512];
                         sprintf(filepath, "archivos/%s", filename);
@@ -584,7 +566,7 @@ void *handle_fns_request(void *arg) {
                                 fclose(file);
                                 
                                 send(fns_socket, "WRITE_RECORD_SUCCESS", 20, 0);
-                                printf("Registro %d del archivo %s escrito exitosamente\n", record_number, filename);
+                                //printf("Registro %d del archivo %s escrito exitosamente\n", record_number, filename);
                             } else {
                                 send(fns_socket, "WRITE_RECORD_ERROR", 18, 0);
                                 printf("Error escribiendo registro en archivo %s\n", filename);
@@ -605,7 +587,6 @@ void *handle_fns_request(void *arg) {
                 send(fns_socket, "WRITE_RECORD_ERROR", 18, 0);
                 printf("Error: Comando WR demasiado corto\n");
             }
-            printf("====================================\n");
         }
     }
     

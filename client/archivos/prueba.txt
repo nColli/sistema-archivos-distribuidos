@@ -1,7 +1,8 @@
-esto es una prueba!!!!!
-2:!hola mundo cruel!!!
-3:desde cliente prueba!!!
+1:esto es una prueba desde el cliente 
+!hola mundo cruel!!!
+desde cliente prueba!!!
 hola desde el
 cliente
 prueba
-prueba2
+cliente externo
+8:interno
