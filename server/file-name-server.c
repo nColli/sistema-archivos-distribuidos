@@ -500,36 +500,78 @@ void print_file_table() {
 
 void print_file_table_unlocked() {
     printf("\n=== TABLA DE ARCHIVOS ===\n");
-    printf("%-20s %-15s %-10s %-10s\n", "ARCHIVO", "IP", "PUERTO", "LOCK");
-    printf("--------------------------------------------------------\n");
     
     if (tabla_archivos == NULL) {
         printf("No hay archivos registrados.\n");
-    } else {
-        entrada_tabla_archivo *current = tabla_archivos;
-        int contador = 1;
-        
-        while (current != NULL) {
-            // Convertir IP de formato numérico a string
-            struct in_addr addr;
-            addr.s_addr = htonl(current->ip);
-            char ip_str[16];
-            inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-            
-            printf("%-20s %-15s %-10d %-10s\n", 
-                   current->nombre_archivo, 
-                   ip_str, 
-                   current->port,
-                   current->lock ? "SI" : "NO");
-            
-            current = current->next;
-            contador++;
-        }
-        printf("--------------------------------------------------------\n");
-        printf("Total de archivos: %d\n", contador - 1);
+        printf("====================================\n\n");
+        return;
     }
     
-    printf("=========================\n\n");
+    entrada_tabla_archivo *current = tabla_archivos;
+    int contador = 1;
+    
+    while (current != NULL) {
+        // Convertir IP de formato numérico a string
+        struct in_addr addr;
+        addr.s_addr = htonl(current->ip);
+        char ip_str[16];
+        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+        
+        printf("--- ARCHIVO #%d ---\n", contador);
+        printf("Nombre: %s\n", current->nombre_archivo);
+        printf("IP: %s | Puerto: %d | Lock: %s\n", 
+               ip_str, current->port, current->lock ? "SI" : "NO");
+        
+        // Mostrar cola de espera del archivo
+        printf("Cola de espera del archivo: ");
+        if (current->cola_espera == NULL) {
+            printf("VACIA\n");
+        } else {
+            printf("\n");
+            nodo_espera_t *waiting_node = current->cola_espera;
+            int wait_pos = 1;
+            while (waiting_node != NULL) {
+                printf("  %d. Socket: %d, Puerto: %d\n", 
+                       wait_pos, waiting_node->client_socket, waiting_node->client_port);
+                waiting_node = waiting_node->next;
+                wait_pos++;
+            }
+        }
+        
+        // Mostrar tabla de registros
+        printf("Tabla de registros: ");
+        if (current->tabla_registros == NULL) {
+            printf("VACIA\n");
+        } else {
+            printf("\n");
+            printf("  Registro #%d | Lock: %s\n", 
+                   current->tabla_registros->registro,
+                   current->tabla_registros->lock ? "SI" : "NO");
+            
+            // Mostrar cola de espera del registro
+            printf("  Cola de espera del registro: ");
+            if (current->tabla_registros->cola_espera == NULL) {
+                printf("VACIA\n");
+            } else {
+                printf("\n");
+                nodo_espera_t *record_waiting = current->tabla_registros->cola_espera;
+                int record_wait_pos = 1;
+                while (record_waiting != NULL) {
+                    printf("    %d. Socket: %d, Puerto: %d\n", 
+                           record_wait_pos, record_waiting->client_socket, record_waiting->client_port);
+                    record_waiting = record_waiting->next;
+                    record_wait_pos++;
+                }
+            }
+        }
+        
+        printf("\n");
+        current = current->next;
+        contador++;
+    }
+    
+    printf("Total de archivos: %d\n", contador - 1);
+    printf("====================================\n\n");
 }
 
 void remove_file_from_table(char *filename, datos_cliente_t *data) {
@@ -1315,7 +1357,7 @@ void request_file_for_write(entrada_tabla_archivo *file_entry, datos_cliente_t *
         send(requesting_client->client_socket, respuesta, strlen(respuesta), 0);
     }
     
-    // NO desbloqueamos aquí - el archivo permanece bloqueado hasta que se complete la escritura
+    // NO desbloqueamos aca - el archivo permanece bloqueado hasta que se complete la escritura
 }
 
 void handle_write_back(char *buffer, datos_cliente_t *data) {
