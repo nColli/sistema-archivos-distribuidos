@@ -14,6 +14,7 @@
 typedef struct nodo_espera {
     int client_port;
     int client_socket;
+    int record_number; // 0 = quiere escribir archivo completo, >0 = quiere escribir registro específico
     struct nodo_espera *next;
 } nodo_espera_t;
 
@@ -78,6 +79,7 @@ void request_file_for_write(entrada_tabla_archivo *file_entry, datos_cliente_t *
 void send_modified_content_to_server(entrada_tabla_archivo *file_entry, char *content);
 void add_to_waiting_queue(entrada_tabla_archivo *file_entry, datos_cliente_t *client);
 void add_to_waiting_queue_front(entrada_tabla_archivo *file_entry, datos_cliente_t *client);
+void add_to_waiting_queue_record(entrada_tabla_archivo *file_entry, datos_cliente_t *client, int record_number);
 void process_next_in_queue(entrada_tabla_archivo *file_entry);
 void register_file_server(uint32_t ip, int file_server_port);
 int find_file_server_port(uint32_t ip);
@@ -710,6 +712,7 @@ void add_to_waiting_queue(entrada_tabla_archivo *file_entry, datos_cliente_t *cl
     
     new_node->client_socket = client->client_socket;
     new_node->client_port = ntohs(client->client_addr.sin_port);
+    new_node->record_number = 0; // 0 = quiere escribir archivo completo
     new_node->next = NULL;
     
     // Agregar al final de la cola
@@ -1083,10 +1086,10 @@ void handle_write_record(char *buffer, datos_cliente_t *data) {
             // Archivo encontrado
             
             if (file_entry->lock != 0) {
-                // Archivo está bloqueado para escritura completa - agregar a cola general
-                printf("Archivo %s está bloqueado, agregando cliente a cola general\n", filename);
-                add_to_waiting_queue(file_entry, data);
-                
+                // Archivo está bloqueado para escritura completa - agregar a cola con record_number
+                printf("Archivo %s está bloqueado, agregando cliente a cola para registro %d\n", filename, record_number);
+                add_to_waiting_queue_record(file_entry, data, record_number);
+
                 pthread_mutex_unlock(&tabla_mutex);
                 
                 char *respuesta = "WAIT: El archivo está siendo utilizado completamente, esperando...";
@@ -1152,8 +1155,9 @@ void add_to_waiting_queue_front(entrada_tabla_archivo *file_entry, datos_cliente
     
     new_node->client_socket = client->client_socket;
     new_node->client_port = ntohs(client->client_addr.sin_port);
+    new_node->record_number = 0; // 0 = quiere escribir archivo completo
     
-    // Agregar al FRENTE de la cola (priority)
+    // Agregar al FRENTE de la cola (prioridad alta)
     new_node->next = file_entry->cola_espera;
     file_entry->cola_espera = new_node;
     
@@ -1557,16 +1561,55 @@ void send_modified_content_to_server(entrada_tabla_archivo *file_entry, char *co
     close(file_server_socket);
 }
 
-
-
 void process_next_in_queue(entrada_tabla_archivo *file_entry) {
     // Esta función debe ser llamada con el mutex ya bloqueado
-    if (file_entry->cola_espera != NULL && file_entry->lock == 0 && file_entry->tabla_registros == NULL) {
+    if (file_entry->tabla_registros != NULL) {
+        // Si hay registros activos, verificar si hay clientes esperando para ese registro
+        if (file_entry->tabla_registros->cola_espera != NULL) {
+            printf("Proximo sera un registro\n");
+            // Hay clientes esperando para el registro activo - procesar el siguiente
+            nodo_espera_t *next_client = file_entry->tabla_registros->cola_espera;
+            file_entry->tabla_registros->cola_espera = next_client->next;
+            
+            // Crear datos_cliente_t temporales para el cliente que espera
+            datos_cliente_t temp_client;
+            temp_client.client_socket = next_client->client_socket;
+            temp_client.client_addr.sin_port = htons(next_client->client_port);
+            
+            int record_number = next_client->record_number; // Usar el record_number del nodo
+            printf("Procesando siguiente cliente en cola para registro %d\n", record_number);
+            
+            // Liberar el nodo de espera
+            free(next_client);
+            
+            // Mantener el registro bloqueado para el siguiente cliente
+            file_entry->tabla_registros->lock = 1;
+            
+            pthread_mutex_unlock(&tabla_mutex);
+            
+            // Solicitar registro para escritura para el siguiente cliente
+            request_record_for_write(file_entry, record_number, &temp_client);
+            
+            pthread_mutex_lock(&tabla_mutex);
+            return; // Salir después de procesar el registro
+        } else {
+            // No hay clientes esperando para el registro - remover el registro
+            int record_number = file_entry->tabla_registros->registro;
+            printf("No hay más clientes esperando el registro %d, removiendo de tabla\n", record_number);
+            remove_record_from_table(file_entry, record_number);
+            
+            // Ahora que no hay registros activos, verificar si hay clientes esperando archivo completo
+            if (file_entry->tabla_registros == NULL) {
+                printf("No quedan registros activos, procesando cola de archivo completo\n");
+                // Continuar para procesar la cola de archivo completo
+            }
+        }
+    }
+
+    if (file_entry->cola_espera != NULL && file_entry->lock == 0 && file_entry->tabla_registros == NULL) { //siempre se da prioridad a registros no a archivos completos
         // Hay clientes esperando, el archivo no está bloqueado Y no hay registros activos
-        file_entry->lock = 1;
-        printf("Procesando siguiente cliente en cola para archivo %s\n", file_entry->nombre_archivo);
         
-        // Obtener el próximo cliente en la cola y REMOVERLO de la cola
+        // Obtener el próximo cliente en la cola
         nodo_espera_t *next_client = file_entry->cola_espera;
         file_entry->cola_espera = next_client->next; // Remover de la cola
         
@@ -1575,13 +1618,30 @@ void process_next_in_queue(entrada_tabla_archivo *file_entry) {
         temp_client.client_socket = next_client->client_socket;
         temp_client.client_addr.sin_port = htons(next_client->client_port);
         
+        int record_number = next_client->record_number;
+        
         // Liberar el nodo de espera ya que ya no está en la cola
         free(next_client);
         
-        // Solicitar archivo para escritura (no para lectura)
-        pthread_mutex_unlock(&tabla_mutex); // Desbloquear temporalmente
-        request_file_for_write(file_entry, &temp_client);
-        pthread_mutex_lock(&tabla_mutex); // Volver a bloquear
+        if (record_number == 0) {
+            // Cliente quiere escribir archivo completo
+            file_entry->lock = 1;
+            printf("Procesando siguiente cliente en cola para escribir archivo completo %s\n", file_entry->nombre_archivo);
+            
+            pthread_mutex_unlock(&tabla_mutex);
+            request_file_for_write(file_entry, &temp_client);
+            pthread_mutex_lock(&tabla_mutex);
+        } else {
+            // Cliente quiere escribir registro específico
+            printf("Procesando siguiente cliente en cola para escribir registro %d del archivo %s\n", record_number, file_entry->nombre_archivo);
+            
+            // Crear record entry y proceder con escritura de registro
+            add_record_to_table(file_entry, record_number, &temp_client);
+            
+            pthread_mutex_unlock(&tabla_mutex);
+            request_record_for_write(file_entry, record_number, &temp_client);
+            pthread_mutex_lock(&tabla_mutex);
+        }
     } else if (file_entry->cola_espera != NULL) {
         // Hay clientes esperando pero no se puede procesar aún
         if (file_entry->lock != 0) {
@@ -1654,7 +1714,6 @@ int is_record_locked(entrada_tabla_archivo *file_entry, int record_number) {
 
 void add_record_to_table(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *client) {
     // Crear nuevo registro en la tabla
-    // Por simplicidad, usaremos el primer slot disponible en la tabla_registros
     if (file_entry->tabla_registros == NULL) {
         file_entry->tabla_registros = malloc(sizeof(entrada_tabla_registro));
         if (file_entry->tabla_registros == NULL) {
@@ -1694,6 +1753,7 @@ void add_to_record_waiting_queue(entrada_tabla_archivo *file_entry, int record_n
         
         new_node->client_socket = client->client_socket;
         new_node->client_port = ntohs(client->client_addr.sin_port);
+        new_node->record_number = record_number; // Para registros específicos
         new_node->next = NULL;
         
         // Agregar al final de la cola del registro
@@ -1845,5 +1905,31 @@ void send_modified_record_to_server(entrada_tabla_archivo *file_entry, int recor
     }
     
     close(file_server_socket);
+}
+
+void add_to_waiting_queue_record(entrada_tabla_archivo *file_entry, datos_cliente_t *client, int record_number) {
+    nodo_espera_t *new_node = malloc(sizeof(nodo_espera_t));
+    if (!new_node) {
+        printf("Error: No se pudo asignar memoria para nodo de espera\n");
+        return;
+    }
+    
+    new_node->client_socket = client->client_socket;
+    new_node->client_port = ntohs(client->client_addr.sin_port);
+    new_node->record_number = record_number; // record_number específico
+    new_node->next = NULL;
+    
+    // Agregar al final de la cola
+    if (file_entry->cola_espera == NULL) {
+        file_entry->cola_espera = new_node;
+    } else {
+        nodo_espera_t *current = file_entry->cola_espera;
+        while (current->next != NULL) {
+            current = current->next;
+        }
+        current->next = new_node;
+    }
+    
+    printf("Cliente agregado a cola de espera del archivo %s para registro %d\n", file_entry->nombre_archivo, record_number);
 }
 

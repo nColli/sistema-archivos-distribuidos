@@ -522,14 +522,12 @@ void *handle_fns_request(void *arg) {
                         printf("Escribiendo registro %d del archivo: %s\n", record_number, filepath);
                         printf("Contenido: %s\n", content_start);
                         
-                        // Read all lines from file
                         FILE *file = fopen(filepath, "r");
-                        char lines[100][MAX_MSG]; // Support up to 100 lines
+                        char lines[100][MAX_MSG]; 
                         int line_count = 0;
                         
                         if (file) {
                             while (fgets(lines[line_count], MAX_MSG, file) && line_count < 100) {
-                                // Remove newline if present
                                 size_t len = strlen(lines[line_count]);
                                 if (len > 0 && lines[line_count][len-1] == '\n') {
                                     lines[line_count][len-1] = '\0';
@@ -538,18 +536,15 @@ void *handle_fns_request(void *arg) {
                             }
                             fclose(file);
                         }
-                        
-                        // Ensure we have enough lines (expand file if necessary)
+
                         while (line_count < record_number) {
                             strcpy(lines[line_count], "");
                             line_count++;
                         }
                         
-                        // Update the specific record
                         if (record_number > 0 && record_number <= line_count) {
                             strcpy(lines[record_number - 1], content_start);
                             
-                            // Write all lines back to file
                             file = fopen(filepath, "w");
                             if (file) {
                                 for (int i = 0; i < line_count; i++) {
@@ -1070,9 +1065,9 @@ void send_write_request(char *message) {
                 printf("Error: Conexión perdida mientras esperaba en cola\n");
             }
         } else if (strncmp(respuesta, "NOTFOUND:", 9) == 0) {
-            printf("%s\n", respuesta + 10); // Skip "NOTFOUND: "
+            printf("%s\n", respuesta + 10);
         } else if (strncmp(respuesta, "ERROR:", 6) == 0) {
-            printf("%s\n", respuesta + 7); // Skip "ERROR: "
+            printf("%s\n", respuesta + 7);
         } else {
             printf("Respuesta del servidor: %s\n", respuesta);
         }
