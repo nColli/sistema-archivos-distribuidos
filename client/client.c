@@ -421,13 +421,13 @@ void *handle_fns_request(void *arg) {
                 int current_line = 1;
                 int found = 0;
 
-                printf("Archivo existe datos:\n");
-                printf("fuera del while Current line %d\n record_number %d\n", current_line, record_number);
+                //printf("Archivo existe datos:\n");
+                //printf("fuera del while Current line %d\n record_number %d\n", current_line, record_number);
 
                 usleep(10000);
 
                 while (fgets(line, sizeof(line), file) && current_line <= record_number) {
-                    printf("Current line %d\n record_number %d\n", current_line, record_number);
+                    //printf("Current line %d\n record_number %d\n", current_line, record_number);
                     if (current_line == record_number) {
                         found = 1;
                         
@@ -436,16 +436,8 @@ void *handle_fns_request(void *arg) {
                             line[len-1] = '\0';
                         }
 
-                        char *clean_content = line;
-                        char record_prefix[20];
-                        sprintf(record_prefix, "%d:", record_number);
-
-                        if (strncmp(line, record_prefix, strlen(record_prefix)) == 0) {
-                            clean_content = line + strlen(record_prefix);
-                        }
-                        
                         char response[MAX_MSG];
-                        sprintf(response, "RECORD_CONTENT:%s:%d:%s", filename, record_number, clean_content);
+                        sprintf(response, "RECORD_CONTENT:%s:%d:%s", filename, record_number, line);
                         send(fns_socket, response, strlen(response), 0);
                         printf("Enviado registro %d del archivo %s al FNS\n", record_number, filename);
                         break;
@@ -507,7 +499,7 @@ void *handle_fns_request(void *arg) {
             int record_number;
             char *content_start = NULL;
             
-            printf("DEBUG - Comando WR recibido: %s\n", buffer);
+            //printf("DEBUG - Comando WR recibido: %s\n", buffer);
             
             // "WR filename record_number content"
             if (strlen(buffer) > 3) {
@@ -849,11 +841,18 @@ void send_write_request(char *message) {
                 strncpy(received_filename, respuesta + 21, sizeof(received_filename) - 1);
                 received_filename[sizeof(received_filename) - 1] = '\0';
                 *first_colon = ':';
+
+                //printf("Respuesta: %s\n", respuesta);
                 
                 char *second_colon = strchr(first_colon + 1, ':');
                 if (second_colon) {
                     record_number = atoi(first_colon + 1);
-                    content_start = second_colon + 1;
+                    char *third_colon = strchr(second_colon + 1, ':');
+                    if (third_colon) {
+                        content_start = third_colon + 1;
+                    } else {
+                        printf("Error: No se encontró tercer ':' en WRITE_RECORD_CONTENT\n");
+                    }
                     
                     char temp_filename[300];
                     sprintf(temp_filename, "%s_record_%d.tmp", received_filename, record_number);
@@ -999,7 +998,13 @@ void send_write_request(char *message) {
                         char *second_colon = strchr(first_colon + 1, ':');
                         if (second_colon) {
                             record_number = atoi(first_colon + 1);
-                            content_start = second_colon + 1;
+                            char *third_colon = strchr(second_colon + 1, ':');
+                            if (third_colon) {
+                                content_start = third_colon + 1;
+                            } else {
+                                printf("Error: No se encontró tercer ':' en WRITE_RECORD_CONTENT\n");
+                                return;
+                            }
                             
                             char temp_filename[300];
                             sprintf(temp_filename, "%s_record_%d.tmp", received_filename, record_number);
