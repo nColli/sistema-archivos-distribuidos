@@ -89,6 +89,7 @@ int is_record_locked(entrada_tabla_archivo *file_entry, int record_number);
 void add_record_to_table(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *client);
 void remove_record_from_table(entrada_tabla_archivo *file_entry, int record_number);
 void add_to_record_waiting_queue(entrada_tabla_archivo *file_entry, int record_number, datos_cliente_t *client);
+void handle_add_record(char *buffer, datos_cliente_t *data);
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -313,6 +314,10 @@ void handle_client(char *buffer, datos_cliente_t *data) {
     } else if (strncmp(comando, "WB", 2) == 0) { //C WB filename content
         printf("Cliente enviando contenido modificado\n");
         handle_write_back(comando, data);
+        return;
+    } else if (strncmp(comando, "AR", 2) == 0) { //C AR filename content
+        printf("Cliente solicitó agregar registro\n");
+        handle_add_record(comando, data);
         return;
     }
     
@@ -1931,5 +1936,120 @@ void add_to_waiting_queue_record(entrada_tabla_archivo *file_entry, datos_client
     }
     
     printf("Cliente agregado a cola de espera del archivo %s para registro %d\n", file_entry->nombre_archivo, record_number);
+}
+
+void handle_add_record(char *buffer, datos_cliente_t *data) {
+    char filename[256];
+    char *content_start = NULL;
+    
+    // Formato esperado: "AR filename content"
+    char *first_space = strstr(buffer, " ");
+    if (!first_space) {
+        char *respuesta = "ERROR: Formato inválido en comando AR";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        printf("Error: Formato inválido en comando AR\n");
+        return;
+    }
+    first_space++;
+    
+    char *second_space = strstr(first_space, " ");
+    if (!second_space) {
+        char *respuesta = "ERROR: Formato inválido en comando AR";
+        send(data->client_socket, respuesta, strlen(respuesta), 0);
+        printf("Error: Formato inválido en comando AR\n");
+        return;
+    }
+
+    int filename_len = second_space - first_space;
+    strncpy(filename, first_space, filename_len);
+    filename[filename_len] = '\0';
+
+    content_start = second_space + 1;
+    
+    printf("Solicitud para agregar registro al archivo: %s, contenido: %s\n", filename, content_start);
+    
+    pthread_mutex_lock(&tabla_mutex);
+    
+    // Buscar el archivo en la tabla
+    entrada_tabla_archivo *current = tabla_archivos;
+    while (current != NULL) {
+        if (current->nombre_archivo != NULL && igual(current->nombre_archivo, filename)) {
+            // Archivo encontrado - enviar comando al file server
+            pthread_mutex_unlock(&tabla_mutex);
+            
+            // Crear socket para conectar al file server
+            int file_server_socket = socket(AF_INET, SOCK_STREAM, 0);
+            if (file_server_socket < 0) {
+                printf("Error creando socket para file server\n");
+                char *respuesta = "ERROR: No se pudo crear socket para file server";
+                send(data->client_socket, respuesta, strlen(respuesta), 0);
+                return;
+            }
+            
+            // Configurar dirección del file server
+            struct sockaddr_in file_server_addr;
+            memset(&file_server_addr, 0, sizeof(file_server_addr));
+            file_server_addr.sin_family = AF_INET;
+            file_server_addr.sin_addr.s_addr = htonl(current->ip);
+            file_server_addr.sin_port = htons(current->port);
+            
+            printf("Conectando a file server para agregar registro en IP: %s, Puerto: %d\n", 
+                   inet_ntoa((struct in_addr){htonl(current->ip)}), current->port);
+            
+            // Conectar al file server
+            if (connect(file_server_socket, (struct sockaddr*)&file_server_addr, sizeof(file_server_addr)) < 0) {
+                printf("Error conectando al file server\n");
+                close(file_server_socket);
+                char *respuesta = "ERROR: No se pudo conectar al file server";
+                send(data->client_socket, respuesta, strlen(respuesta), 0);
+                return;
+            }
+            
+            // Crear mensaje para el file server
+            char request_msg[MAX_MSG];
+            sprintf(request_msg, "ADD_RECORD:%s:%s", filename, content_start);
+            
+            printf("Enviando comando al file server: %s\n", request_msg);
+            
+            // Enviar comando al file server
+            int bytes_sent = send(file_server_socket, request_msg, strlen(request_msg), 0);
+            if (bytes_sent < 0) {
+                printf("Error enviando comando al file server\n");
+                close(file_server_socket);
+                char *respuesta = "ERROR: No se pudo enviar comando al file server";
+                send(data->client_socket, respuesta, strlen(respuesta), 0);
+                return;
+            }
+            
+            printf("Comando enviado al file server, esperando respuesta...\n");
+            
+            // Recibir respuesta del file server
+            char response[MAX_MSG];
+            int bytes_received = recv(file_server_socket, response, MAX_MSG - 1, 0);
+            
+            close(file_server_socket);
+            
+            if (bytes_received > 0) {
+                response[bytes_received] = '\0';
+                printf("Respuesta recibida del file server: %s\n", response);
+                
+                // Reenviar respuesta al cliente
+                send(data->client_socket, response, strlen(response), 0);
+            } else {
+                printf("Error recibiendo respuesta del file server\n");
+                char *respuesta = "ERROR: No se recibió respuesta del file server";
+                send(data->client_socket, respuesta, strlen(respuesta), 0);
+            }
+            
+            return;
+        }
+        current = current->next;
+    }
+    
+    // Archivo no encontrado
+    pthread_mutex_unlock(&tabla_mutex);
+    char *respuesta = "NOTFOUND: El archivo no existe en el sistema";
+    send(data->client_socket, respuesta, strlen(respuesta), 0);
+    printf("Cliente solicitó agregar registro a archivo inexistente: %s\n", filename);
 }
 

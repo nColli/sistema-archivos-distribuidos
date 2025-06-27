@@ -38,6 +38,7 @@ void read_record();
 void write_file();
 void write_record();
 void upload(char *filename);
+void add_record();
 
 int main(int argc, char *argv[]) {
     if (argc != 5) {
@@ -213,6 +214,9 @@ void *client_interface_thread(void *arg) {
             case 8:
                 write_record();
                 break;
+            case 9:
+                add_record();
+                break;
             default:
                 printf("Opcion no implementada\n");
                 continue;
@@ -324,6 +328,10 @@ void send_client_request(char *message) {
             printf("Archivo eliminado exitosamente del sistema\n");
         } else if (strncmp(respuesta, "\nLISTA ARCHIVOS:", 16) == 0) {
             printf("%s\n", respuesta);
+        } else if (strncmp(respuesta, "ADD_RECORD_SUCCESS", 18) == 0) {
+            printf("Registro agregado exitosamente al archivo\n");
+        } else if (strncmp(respuesta, "ADD_RECORD_ERROR", 16) == 0) {
+            printf("Error: No se pudo agregar el registro al archivo\n");
         } else {
             printf("Respuesta del servidor: %s\n", respuesta);
         }
@@ -574,6 +582,41 @@ void *handle_fns_request(void *arg) {
                 send(fns_socket, "WRITE_RECORD_ERROR", 18, 0);
                 printf("Error: Comando WR demasiado corto\n");
             }
+        } else if (strncmp(buffer, "ADD_RECORD:", 11) == 0) {
+            // Add Record - agregar registro al final del archivo
+            char filename[256];
+            char *content_start = NULL;
+            
+            // Formato: ADD_RECORD:filename:content
+            char *first_colon = strchr(buffer + 11, ':');
+            if (first_colon) {
+                int filename_len = first_colon - (buffer + 11);
+                strncpy(filename, buffer + 11, filename_len);
+                filename[filename_len] = '\0';
+                
+                content_start = first_colon + 1;
+                
+                char filepath[512];
+                sprintf(filepath, "archivos/%s", filename);
+                
+                printf("Agregando registro al archivo: %s\n", filepath);
+                printf("Contenido: %s\n", content_start);
+                
+                FILE *file = fopen(filepath, "a"); // Abrir en modo append
+                if (file) {
+                    fprintf(file, "%s\n", content_start);
+                    fclose(file);
+                    
+                    send(fns_socket, "ADD_RECORD_SUCCESS", 18, 0);
+                    printf("Registro agregado exitosamente al archivo %s\n", filename);
+                } else {
+                    send(fns_socket, "ADD_RECORD_ERROR", 16, 0);
+                    printf("Error agregando registro al archivo %s\n", filename);
+                }
+            } else {
+                send(fns_socket, "ADD_RECORD_ERROR", 16, 0);
+                printf("Error: Formato inválido en comando ADD_RECORD\n");
+            }
         }
     }
     
@@ -592,6 +635,7 @@ void print_menu() {
     printf("6. Escribir archivo\n");
     printf("7. Leer registro\n");
     printf("8. Escribir registro\n");
+    printf("9. Agregar registro\n");
 }
 
 void upload(char *filename) {
@@ -1072,4 +1116,29 @@ void send_write_request(char *message) {
             printf("Respuesta del servidor: %s\n", respuesta);
         }
     }
+}
+
+void add_record() {
+    char filename[256];
+    char content[MAX_MSG];
+    
+    printf("Ingrese el nombre del archivo: ");
+    scanf("%s", filename);
+    
+    // Limpiar el buffer de entrada
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+    
+    printf("Ingrese el contenido del nuevo registro: ");
+    fgets(content, sizeof(content), stdin);
+    
+    // Remover el salto de línea del final si existe
+    size_t len = strlen(content);
+    if (len > 0 && content[len-1] == '\n') {
+        content[len-1] = '\0';
+    }
+    
+    char command[MAX_MSG];
+    sprintf(command, "C AR %s %s", filename, content);
+    send_client_request(command);
 }
